@@ -57,10 +57,33 @@ data class LyricLine(
     val timeMs: Int,
     val text: String,
     val cues: List<LyricCue> = emptyList(),
-)
+    val endTimeMs: Int? = null,
+    val cells: List<LyricCell> = emptyList(),
+    val subText: String? = null,
+    val romanizationText: String? = null,
+) {
+    val mainText: String
+        get() = cells.joinToString(separator = "") { it.text }
+            .takeIf { it.isNotBlank() }
+            ?: text.lineSequence().firstOrNull()?.trim().orEmpty()
+
+    val hasStructuredText: Boolean
+        get() = cells.isNotEmpty() || !subText.isNullOrBlank() || !romanizationText.isNullOrBlank()
+
+    fun resolvedEndTimeMs(fallback: Int): Int =
+        endTimeMs?.takeIf { it >= timeMs } ?: fallback
+}
 
 /** A timed visible fragment within a lyric line. The text retains source spacing and punctuation. */
 data class LyricCue(
     val timeMs: Int,
     val text: String,
+)
+
+/** A timed visible fragment within the original LyricLine text. */
+data class LyricCell(
+    val startTimeMs: Int,
+    val endTimeMs: Int,
+    val text: String,
+    val timed: Boolean = true,
 )

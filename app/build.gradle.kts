@@ -1,11 +1,95 @@
-﻿import java.util.Properties
+﻿import org.gradle.api.DefaultTask
+import org.gradle.api.GradleException
+import org.gradle.api.provider.Property
+import org.gradle.api.tasks.Input
+import org.gradle.api.tasks.TaskAction
+import org.gradle.api.tasks.testing.Test
+import java.io.File
+import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.ksp)
     alias(libs.plugins.roborazzi)
+}
+
+@DisableCachingByDefault(because = "Checks optional local FFmpeg artifacts.")
+abstract class CheckMedia3FfmpegDsdTask : DefaultTask() {
+    @get:Input
+    abstract val ffmpegSource: Property<String>
+
+    @get:Input
+    abstract val localAarPath: Property<String>
+
+    @get:Input
+    abstract val generatedAarPath: Property<String>
+
+    @get:Input
+    abstract val localJniPath: Property<String>
+
+    @TaskAction
+    fun checkConfiguredArtifact() {
+        when (val source = ffmpegSource.get()) {
+            "localaar", "local-aar", "local_aar" -> {
+                val file = File(localAarPath.get())
+                if (!file.exists()) missingArtifact("localAar", file)
+            }
+
+            "generatedaar", "generated-aar", "generated_aar" -> {
+                val file = File(generatedAarPath.get())
+                if (!file.exists()) missingArtifact("generatedAar", file)
+            }
+
+            "project" -> {
+                val file = File(localJniPath.get())
+                if (!file.exists()) missingArtifact("project", file)
+            }
+
+            "fallback", "official", "jellyfin" -> {
+                logger.warn(
+                    """
+                    |
+                    | *** libffmpegJNI with dsd_lsbf is disabled.
+                    | *** Current mica.ffmpegSource=$source.
+                    | *** DSF playback will use the fallback FFmpeg dependency.
+                    |
+                    """.trimMargin(),
+                )
+            }
+
+            else -> unsupportedSource(source)
+        }
+    }
+
+    private fun missingArtifact(source: String, file: File): Nothing =
+        throw GradleException(
+            """
+            mica.ffmpegSource=$source, but the configured artifact was not found.
+
+            Expected:
+              ${file.absolutePath}
+
+            Run:
+              .\scripts\build-media3-ffmpeg-dsd.ps1
+
+            Or switch to:
+              mica.ffmpegSource=fallback
+            """.trimIndent(),
+        )
+
+    private fun unsupportedSource(source: String): Nothing =
+        throw GradleException(
+            """
+            Unsupported mica.ffmpegSource: $source
+
+            Supported values:
+              - fallback
+              - localAar
+              - generatedAar
+              - project
+            """.trimIndent(),
+        )
 }
 
 providers.gradleProperty("mica.alternateBuildDir").orNull?.let { alternateDir ->
@@ -16,16 +100,27 @@ val qaSideBySide = providers.gradleProperty("mica.qaSideBySide")
     .map(String::toBoolean)
     .getOrElse(false)
 
-val media3FfmpegLocalAar = file("libs/media3-ffmpeg-decoder-dsd.aar")
-val media3FfmpegGeneratedAar =
-    layout.buildDirectory.file("generated/media3-ffmpeg/media3-ffmpeg-decoder-dsd.aar").get().asFile
-val media3FfmpegLocalJni =
-    rootProject.file("third_party/media3-ffmpeg-decoder/src/main/jniLibs/arm64-v8a/libffmpegJNI.so")
+val selectedFfmpegSource = providers.gradleProperty("mica.ffmpegSource")
+    .map(String::trim)
+    .map(String::lowercase)
+    .getOrElse("fallback")
+
+val media3FfmpegLocalAarPath = file("libs/media3-ffmpeg-decoder-dsd.aar").absolutePath
+
+val media3FfmpegGeneratedAarPath = layout.buildDirectory
+    .file("generated/media3-ffmpeg/media3-ffmpeg-decoder-dsd.aar")
+    .get()
+    .asFile
+    .absolutePath
+
+val media3FfmpegLocalJniPath = rootProject
+    .file("third_party/media3-ffmpeg-decoder/src/main/jniLibs/arm64-v8a/libffmpegJNI.so")
+    .absolutePath
 
 val keystorePropertiesFile = rootProject.file("keystore.properties")
 val keystoreProperties = Properties().apply {
     if (keystorePropertiesFile.exists()) {
-        load(keystorePropertiesFile.inputStream())
+        keystorePropertiesFile.inputStream().use(::load)
     }
 }
 
@@ -34,14 +129,15 @@ fun readReleaseSigningEnv(name: String): String? =
 
 android {
     namespace = "com.mica.music"
-    compileSdk = 35
+    compileSdk = 37
 
     defaultConfig {
         applicationId = if (qaSideBySide) "com.mica.music.qa" else "com.mica.music"
         minSdk = 26
-        targetSdk = 34
+        targetSdk = 37
         versionCode = 32
         versionName = "0.2.0" + if (qaSideBySide) "-qa" else ""
+
         ndk {
             // 仅 64 位真机；自编 FFmpeg 也只编 arm64-v8a
             abiFilters += listOf("arm64-v8a")
@@ -56,6 +152,7 @@ android {
     signingConfigs {
         create("release") {
             val ciKeystoreFile = readReleaseSigningEnv("MICA_KEYSTORE_FILE")?.let(::file)
+
             when {
                 ciKeystoreFile?.exists() == true -> {
                     storeFile = ciKeystoreFile
@@ -63,6 +160,7 @@ android {
                     keyAlias = readReleaseSigningEnv("MICA_KEY_ALIAS")
                     keyPassword = readReleaseSigningEnv("MICA_KEY_PASSWORD")
                 }
+
                 keystorePropertiesFile.exists() -> {
                     storeFile = rootProject.file(keystoreProperties.getProperty("storeFile"))
                     storePassword = keystoreProperties.getProperty("storePassword")
@@ -76,14 +174,17 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
+
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
+                "proguard-rules.pro",
             )
+
             signingConfigs.findByName("release")
                 ?.takeIf { it.storeFile?.exists() == true }
                 ?.let { signingConfig = it }
         }
+
         create("perf") {
             initWith(getByName("release"))
             isDebuggable = qaSideBySide
@@ -97,10 +198,6 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
-
     buildFeatures {
         compose = true
     }
@@ -109,6 +206,7 @@ android {
         jniLibs {
             useLegacyPackaging = true
         }
+
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
@@ -126,14 +224,6 @@ ksp {
 
 roborazzi {
     outputDir.set(file("src/test/snapshots"))
-}
-
-configurations.configureEach {
-    resolutionStrategy.force(
-        "androidx.activity:activity:1.9.2",
-        "androidx.activity:activity-ktx:1.9.2",
-        "androidx.activity:activity-compose:1.9.2",
-    )
 }
 
 dependencies {
@@ -160,27 +250,55 @@ dependencies {
     implementation(libs.androidx.media3.common)
     implementation(libs.androidx.media3.session)
 
-    when {
-        media3FfmpegLocalAar.exists() -> implementation(files(media3FfmpegLocalAar))
-        media3FfmpegGeneratedAar.exists() -> implementation(files(media3FfmpegGeneratedAar))
-        media3FfmpegLocalJni.exists() -> implementation(project(":media3-ffmpeg-decoder-dsd"))
-        else -> {
+    when (selectedFfmpegSource) {
+        "localaar", "local-aar", "local_aar" -> {
+            implementation(files(media3FfmpegLocalAarPath))
+        }
+
+        "generatedaar", "generated-aar", "generated_aar" -> {
+            implementation(files(media3FfmpegGeneratedAarPath))
+        }
+
+        "project" -> {
+            implementation(project(":media3-ffmpeg-decoder-dsd"))
+        }
+
+        "fallback", "official", "jellyfin" -> {
             logger.warn(
                 """
                 |
-                | *** DSD-enabled Media3 FFmpeg not found.
-                | *** Run: .\scripts\build-media3-ffmpeg-dsd.ps1
-                | *** Falling back to org.jellyfin.media3:media3-ffmpeg-decoder (no DSD / audio/dsd).
+                | *** Using fallback FFmpeg dependency.
+                | *** DSD-enabled Media3 FFmpeg is disabled.
+                | *** To enable it, set one of:
+                | ***   mica.ffmpegSource=localAar
+                | ***   mica.ffmpegSource=generatedAar
+                | ***   mica.ffmpegSource=project
                 |
                 """.trimMargin(),
             )
+
             implementation(libs.androidx.media3.exoplayer.ffmpeg)
+        }
+
+        else -> {
+            throw GradleException(
+                """
+                Unsupported mica.ffmpegSource: $selectedFfmpegSource
+
+                Supported values:
+                  - fallback
+                  - localAar
+                  - generatedAar
+                  - project
+                """.trimIndent(),
+            )
         }
     }
 
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)
     ksp(libs.androidx.room.compiler)
+
     implementation(libs.reorderable)
     implementation(libs.kyant.taglib)
     implementation(libs.jaudiotagger)
@@ -203,28 +321,24 @@ dependencies {
     testImplementation(libs.roborazzi.junit.rule)
 }
 
+val checkMedia3FfmpegDsd = tasks.register("checkMedia3FfmpegDsd", CheckMedia3FfmpegDsdTask::class) {
+    group = "verification"
+    description = "Checks whether the configured DSD-enabled Media3 FFmpeg artifact exists."
+
+    ffmpegSource.set(selectedFfmpegSource)
+    localAarPath.set(media3FfmpegLocalAarPath)
+    generatedAarPath.set(media3FfmpegGeneratedAarPath)
+    localJniPath.set(media3FfmpegLocalJniPath)
+}
+
 tasks.named("preBuild") {
-    doFirst {
-        if (
-            !media3FfmpegLocalAar.exists() &&
-            !media3FfmpegGeneratedAar.exists() &&
-            !media3FfmpegLocalJni.exists()
-        ) {
-            logger.warn(
-                """
-                |
-                | *** libffmpegJNI with dsd_lsbf missing.
-                | *** Run: .\scripts\build-media3-ffmpeg-dsd.ps1 for Exo DSF playback.
-                |
-                """.trimMargin(),
-            )
-        }
-    }
+    dependsOn(checkMedia3FfmpegDsd)
 }
 
 tasks.register("micaCheck") {
     group = "verification"
     description = "Runs Mica's compile, lint, JVM/Robolectric, and screenshot regression gates."
+
     dependsOn(
         "compileDebugKotlin",
         "lintDebug",
@@ -236,23 +350,26 @@ tasks.register("micaCheck") {
 tasks.register("micaScreenshotFull") {
     group = "verification"
     description = "Runs the complete Roborazzi screenshot regression matrix."
+
     dependsOn("verifyRoborazziDebug")
 }
 
 tasks.register("micaRecordScreenshotFull") {
     group = "verification"
     description = "Records the complete Roborazzi screenshot regression matrix."
+
     dependsOn("recordRoborazziDebug")
 }
 
 val nightlyRequested = gradle.startParameter.taskNames.any {
     it.substringAfterLast(':') == "micaNightlyCheck"
 }
+
 val fullScreenshotsRequested = nightlyRequested || gradle.startParameter.taskNames.any {
     it.substringAfterLast(':') in setOf("micaScreenshotFull", "micaRecordScreenshotFull")
 }
 
-tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+tasks.withType<Test>().configureEach {
     systemProperty("mica.nightly", nightlyRequested.toString())
     systemProperty("mica.fullScreenshots", fullScreenshotsRequested.toString())
     systemProperty("mica.screenshotGolden", fullScreenshotsRequested.toString())
@@ -261,6 +378,7 @@ tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
 tasks.register("micaNightlyCheck") {
     group = "verification"
     description = "Runs compile, lint, all JVM/Robolectric tests, full screenshots, and nightly fuzzing."
+
     dependsOn(
         "micaCheck",
         "micaScreenshotFull",

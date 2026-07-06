@@ -41,7 +41,20 @@ object NotificationLyrics {
         index: Int,
         display: DisplayOptions,
     ): String? {
-        val raw = lyrics.getOrNull(index)?.text?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        val line = lyrics.getOrNull(index) ?: return null
+        if (line.hasStructuredText) {
+            val main = line.mainText.trim()
+            val romanization = line.romanizationText?.trim()?.takeIf { it.isNotBlank() }
+            val translation = line.subText?.trim()?.takeIf { it.isNotBlank() }
+            return when (display.bilingualMode) {
+                LyricsBilingualDisplayMode.ALL -> listOfNotNull(main, romanization, translation)
+                LyricsBilingualDisplayMode.ORIGINAL -> listOf(main)
+                LyricsBilingualDisplayMode.TRANSLATION -> listOfNotNull(translation, romanization).takeIf { it.isNotEmpty() }
+                    ?: listOf(main)
+            }.joinToString(" ").takeIf { it.isNotBlank() }
+        }
+
+        val raw = line.text.trim().takeIf { it.isNotBlank() } ?: return null
         val rows = LyricDisplayRows.rowsForBilingualDisplayMode(
             text = raw,
             enabled = display.splitEnabled,

@@ -1,6 +1,9 @@
 package com.mica.music.ui.screens
 
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.PaddingValues
@@ -8,6 +11,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.Text
@@ -18,6 +22,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.onSizeChanged
@@ -38,6 +43,9 @@ import com.mica.music.ui.components.rememberLyricUniformStyle
 import com.mica.music.ui.theme.HifiSpacing
 import com.mica.music.ui.theme.LocalLyricSplitEnabled
 import com.mica.music.ui.theme.PlayerContentColors
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 @Composable
@@ -84,51 +92,49 @@ internal fun ExpandedLyricsPanel(
     }
 
     val timed = LyricsSync.hasTimedLyrics(lyrics)
-    val currentIndex = LyricsSync.indexForPosition(lyrics, positionMs)
+    val currentIndex = LyricsSync.primaryLineIndexAt(lyrics, positionMs)
+    val highlightLineIndices = remember(lyrics, positionMs) {
+        LyricsSync.highlightLineIndicesAt(lyrics, positionMs)
+    }
     val listState = rememberLazyListState()
     val density = LocalDensity.current
-    val lineHeightPx = with(density) { textStyle.lineHeight.toPx().toInt() }
-    val translationLineHeightPx = with(density) { translationTextStyle.lineHeight.toPx().toInt() }
+    val componentOffsetPx = 0
     var viewportHeightPx by remember { mutableIntStateOf(0) }
-    var currentLineInitiallyPlaced by remember(lyrics) { mutableStateOf(false) }
+    var userScrolling by remember { mutableStateOf(false) }
+    var autoScrolling by remember { mutableStateOf(false) }
+
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress }.collectLatest { scrolling ->
+            if (scrolling) {
+                if (!autoScrolling) userScrolling = true
+            } else {
+                delay(3_000)
+                if (!autoScrolling) userScrolling = false
+            }
+        }
+    }
 
     LaunchedEffect(
         currentIndex,
         timed,
         lyrics,
-        currentLineAnchorYPx,
         viewportHeightPx,
-        lineHeightPx,
-        translationLineHeightPx,
+        highlightLineIndices,
+        userScrolling,
+        componentOffsetPx,
     ) {
         if (!timed || currentIndex < 0) return@LaunchedEffect
+        if (currentIndex !in highlightLineIndices) return@LaunchedEffect
         if (viewportHeightPx <= 0) return@LaunchedEffect
-        val currentRows = lyrics.getOrNull(currentIndex)?.text
-            ?.let {
-                LyricDisplayRows.rowsForBilingualDisplayMode(
-                    text = it,
-                    enabled = lyricSplitEnabled,
-                    mode = bilingualDisplayMode,
-                )
-            }.orEmpty()
-        val bilingualGapPx = with(density) { HifiSpacing.lyricBilingualGap.roundToPx() }
-        val itemHeightPx = if (currentRows.isEmpty()) {
-            lineHeightPx
-        } else {
-            currentRows.sumOf { row ->
-                if (row.splitIndex > 0) translationLineHeightPx else lineHeightPx
-            } + bilingualGapPx * (currentRows.size - 1).coerceAtLeast(0)
-        }
-        val offset = expandedLyricsScrollOffset(
-            viewportHeightPx = viewportHeightPx,
-            itemHeightPx = itemHeightPx,
-            currentLineAnchorYPx = currentLineAnchorYPx,
-        )
-        if (currentLineInitiallyPlaced) {
-            listState.animateScrollToItem(currentIndex, scrollOffset = offset)
-        } else {
-            listState.scrollToItem(currentIndex, scrollOffset = offset)
-            currentLineInitiallyPlaced = true
+        if (userScrolling) return@LaunchedEffect
+        autoScrolling = true
+        try {
+            listState.smoothCenterOnItem(
+                index = currentIndex,
+                componentOffsetPx = componentOffsetPx,
+            )
+        } finally {
+            autoScrolling = false
         }
     }
 
@@ -141,8 +147,8 @@ internal fun ExpandedLyricsPanel(
             contentPadding = PaddingValues(
                 start = horizontalPadding,
                 end = horizontalPadding,
-                top = HifiSpacing.sm,
-                bottom = HifiSpacing.xl,
+                top = with(density) { (viewportHeightPx / 2).toDp() },
+                bottom = with(density) { (viewportHeightPx / 2).toDp() },
             ),
             verticalArrangement = Arrangement.spacedBy(HifiSpacing.lg),
             horizontalAlignment = horizontalAlignment,
@@ -151,7 +157,7 @@ internal fun ExpandedLyricsPanel(
                 lyrics,
                 key = { index, line -> "$index-${line.timeMs}-${line.text}" },
             ) { index, line ->
-                val isCurrent = timed && index == currentIndex
+                val isCurrent = timed && index in highlightLineIndices
                 LyricLineBlock(
                     text = line.text,
                     isCurrent = isCurrent,
@@ -192,6 +198,30 @@ internal fun expandedLyricsScrollOffset(
         ?.takeIf { it.isFinite() && it > 0f }
         ?: (viewportHeightPx / 2f)
     return -((anchor - itemHeightPx / 2f).coerceAtLeast(0f)).roundToInt()
+}
+
+private suspend fun LazyListState.smoothCenterOnItem(
+    index: Int,
+    componentOffsetPx: Int,
+) {
+    val targetInfo = layoutInfo.visibleItemsInfo.firstOrNull { it.index == index }
+    if (targetInfo != null) {
+        val viewportCenter = (layoutInfo.viewportStartOffset + layoutInfo.viewportEndOffset) / 2f +
+            componentOffsetPx
+        val targetCenter = targetInfo.offset + targetInfo.size / 2f
+        val delta = targetCenter - viewportCenter
+        if (abs(delta) > 1f) {
+            animateScrollBy(
+                value = delta,
+                animationSpec = tween(
+                    durationMillis = 700,
+                    easing = FastOutSlowInEasing,
+                ),
+            )
+        }
+    } else {
+        animateScrollToItem(index = index, scrollOffset = componentOffsetPx)
+    }
 }
 
 private fun TextStyle.withFontSizeSp(fontSizeSp: Int): TextStyle {

@@ -1,5 +1,6 @@
 package com.mica.music.data.scanner
 
+import com.mica.music.data.LyricCell
 import com.mica.music.data.LyricCue
 import com.mica.music.data.LyricLine
 import com.mica.music.util.DiagnosticLog
@@ -14,8 +15,13 @@ import org.xml.sax.InputSource
 internal object TtmlLyricsParser {
     private const val MAX_DOCUMENT_CHARS = 2_000_000
     private const val MAX_PARAGRAPHS = 5_000
-    private const val MAX_CUES = 50_000
+    private const val MAX_CELLS = 50_000
     private const val LYRICS_TRACE = "DEBUG-LYRICS-7C31"
+    private const val NS_TTM = "http://www.w3.org/ns/ttml#metadata"
+    private const val NS_ITUNES_INTERNAL = "http://music.apple.com/lyric-ttml-internal"
+    private const val NS_ITUNES_LEGACY = "http://music.apple.com/itunes/ttml"
+    private const val NS_XML = "http://www.w3.org/XML/1998/namespace"
+
     private val forbiddenDeclaration = Regex("""<!\s*(?:DOCTYPE|ENTITY)\b""", RegexOption.IGNORE_CASE)
 
     fun looksLikeTtml(text: String): Boolean {
@@ -50,29 +56,75 @@ internal object TtmlLyricsParser {
                 setEntityResolver { _, _ -> InputSource(StringReader("")) }
             }
             val document = builder.parse(InputSource(StringReader(text)))
-            val paragraphs = document.getElementsByTagNameNS("*", "p")
-            if (paragraphs.length !in 1..MAX_PARAGRAPHS) return emptyList()
+            val root = document.documentElement ?: return emptyList()
+            val paragraphs = root.elementsByLocalName("p")
+            if (paragraphs.size !in 1..MAX_PARAGRAPHS) return emptyList()
 
-            var totalCues = 0
-            buildList {
-                for (index in 0 until paragraphs.length) {
-                    val paragraph = paragraphs.item(index) as? Element ?: continue
-                    val rendered = renderParagraph(paragraph)
-                    totalCues += rendered.cues.size
-                    if (totalCues > MAX_CUES) return emptyList()
-                    val lineText = MetadataTextFix.normalize(rendered.text).trim()
-                    if (lineText.isEmpty()) continue
-                    val lineStart = parseTime(paragraph.getAttribute("begin"))
-                        ?: rendered.cues.firstOrNull()?.timeMs
-                        ?: continue
-                    val cues = rendered.cues.takeIf { candidate ->
-                        candidate.isNotEmpty() &&
-                            candidate.first().timeMs >= lineStart &&
-                            candidate.zipWithNext().none { (left, right) -> right.timeMs < left.timeMs }
-                    }.orEmpty()
-                    add(LyricLine(lineStart.coerceAtLeast(0), lineText, cues))
+            val metadataTranslationsByKey = parseMetadataTranslations(root)
+            val originals = mutableListOf<KeyedLine>()
+            val translations = mutableListOf<KeyedLine>()
+            val romanizations = mutableListOf<KeyedLine>()
+            var totalCells = 0
+
+            paragraphs.forEach { paragraph ->
+                val start = paragraph.attr("begin")?.let(::parseTime)
+                val end = paragraph.attr("end")?.let(::parseTime)
+                if (start == null && end == null) return@forEach
+
+                val fallbackStart = start ?: 0
+                val fallbackEnd = end ?: fallbackStart
+                val parsed = parseParagraphText(paragraph, fallbackStart, fallbackEnd)
+                totalCells += parsed.cells.size
+                if (totalCells > MAX_CELLS) return emptyList()
+
+                val key = paragraph.attr("key", NS_ITUNES_INTERNAL)
+                    ?: paragraph.attr("key", NS_ITUNES_LEGACY)
+                    ?: paragraph.attr("key")
+                val role = paragraph.attr("role", NS_TTM)
+                val lineEnd = end
+                    ?: parsed.cells.lastOrNull { it.timed }?.endTimeMs
+                    ?: fallbackEnd
+
+                when (role) {
+                    "x-translation" -> textOnlyLine(parsed.visibleText, fallbackStart, lineEnd, key)?.let {
+                        translations += KeyedLine(it, key)
+                    }
+                    "x-romanization" -> textOnlyLine(parsed.visibleText, fallbackStart, lineEnd, key)?.let {
+                        romanizations += KeyedLine(it, key)
+                    }
+                    "x-bg" -> Unit
+                    else -> {
+                        lineFromCells(fallbackStart, lineEnd, parsed.cells)?.let { line ->
+                            originals += KeyedLine(line, key)
+                        }
+                        textOnlyLine(parsed.translationText, fallbackStart, lineEnd, key)?.let {
+                            translations += KeyedLine(it, key)
+                        }
+                        textOnlyLine(parsed.romanizationText, fallbackStart, lineEnd, key)?.let {
+                            romanizations += KeyedLine(it, key)
+                        }
+                    }
                 }
-            }.sortedBy { it.timeMs }
+            }
+
+            val translationByKey = (metadataTranslationsByKey + translations)
+                .mapNotNull { keyed -> keyed.key?.let { it to keyed.line.mainText } }
+                .toMap()
+            val translationByStart = translations.associate { it.line.timeMs to it.line.mainText }
+            val romanizationByKey = romanizations
+                .mapNotNull { keyed -> keyed.key?.let { it to keyed.line.mainText } }
+                .toMap()
+            val romanizationByStart = romanizations.associate { it.line.timeMs to it.line.mainText }
+
+            originals
+                .map { keyed ->
+                    val line = keyed.line
+                    val translation = keyed.key?.let { translationByKey[it] } ?: translationByStart[line.timeMs]
+                    val romanization = keyed.key?.let { romanizationByKey[it] } ?: romanizationByStart[line.timeMs]
+                    line.withCompanionText(translation = translation, romanization = romanization)
+                }
+                .filter { it.mainText.isNotBlank() }
+                .sortedBy { it.timeMs }
         }.onFailure { error ->
             DiagnosticLog.event(
                 LYRICS_TRACE,
@@ -81,38 +133,71 @@ internal object TtmlLyricsParser {
         }.getOrDefault(emptyList())
     }
 
-    private data class RenderedParagraph(val text: String, val cues: List<LyricCue>)
+    private data class KeyedLine(val line: LyricLine, val key: String?)
 
-    private fun renderParagraph(paragraph: Element): RenderedParagraph {
-        val text = StringBuilder()
-        val cues = mutableListOf<LyricCue>()
+    private data class ParsedParagraph(
+        val visibleText: String,
+        val translationText: String,
+        val romanizationText: String,
+        val cells: List<LyricCell>,
+    )
 
-        fun append(node: Node) {
+    private fun parseParagraphText(paragraph: Element, fallbackStart: Int, fallbackEnd: Int): ParsedParagraph {
+        val cells = mutableListOf<LyricCell>()
+        val original = StringBuilder()
+        val translation = StringBuilder()
+        val romanization = StringBuilder()
+
+        fun appendVisibleText(node: Node, target: StringBuilder) {
             when (node.nodeType) {
-                Node.TEXT_NODE, Node.CDATA_SECTION_NODE -> text.append(node.nodeValue.orEmpty())
+                Node.TEXT_NODE, Node.CDATA_SECTION_NODE -> target.append(normalizeTtmlText(node.nodeValue.orEmpty()))
+                Node.ELEMENT_NODE -> node.childNodesList().forEach { appendVisibleText(it, target) }
+            }
+        }
+
+        fun appendOriginalText(rawText: String) {
+            val normalized = normalizeTtmlText(rawText)
+            if (!normalized.isFormattingWhitespaceFrom(rawText)) {
+                original.append(normalized)
+            }
+        }
+
+        fun flushOriginalBeforeTimed(timedStart: Int) {
+            val pending = normalizeTtmlText(original.toString())
+            if (!pending.isFormattingWhitespaceFrom(original.toString())) {
+                cells += LyricCell(fallbackStart, timedStart.coerceAtLeast(fallbackStart), pending, timed = false)
+            }
+            original.clear()
+        }
+
+        fun appendTimedCell(element: Element, rawText: String): Boolean {
+            val start = element.attr("begin")?.let(::parseTime) ?: return false
+            val normalized = normalizeTtmlText(rawText)
+            if (normalized.isFormattingWhitespaceFrom(rawText)) return true
+            flushOriginalBeforeTimed(start)
+            val end = (element.attr("end")?.let(::parseTime) ?: fallbackEnd).coerceAtLeast(start)
+            cells += LyricCell(start, end, normalized)
+            return true
+        }
+
+        fun visitOriginalNode(node: Node) {
+            when (node.nodeType) {
+                Node.TEXT_NODE, Node.CDATA_SECTION_NODE -> appendOriginalText(node.nodeValue.orEmpty())
                 Node.ELEMENT_NODE -> {
                     val element = node as Element
-                    when (element.localName?.lowercase() ?: element.tagName.substringAfter(':').lowercase()) {
-                        "br" -> text.append('\n')
-                        "span" -> {
-                            val visible = element.textContent.orEmpty()
-                            val begin = parseTime(element.getAttribute("begin"))
-                            if (begin != null && visible.isNotEmpty()) {
-                                text.append(visible)
-                                cues += LyricCue(begin.coerceAtLeast(0), MetadataTextFix.normalizeFragment(visible))
-                            } else {
-                                var child = element.firstChild
-                                while (child != null) {
-                                    append(child)
-                                    child = child.nextSibling
-                                }
-                            }
-                        }
+                    val role = element.attr("role", NS_TTM)
+                    val visible = StringBuilder().also { appendVisibleText(element, it) }.toString()
+                    when (role) {
+                        "x-translation" -> translation.append(normalizeTtmlText(visible, trimEdges = true))
+                        "x-romanization" -> romanization.append(normalizeTtmlText(visible, trimEdges = true))
+                        "x-bg" -> Unit
                         else -> {
-                            var child = element.firstChild
-                            while (child != null) {
-                                append(child)
-                                child = child.nextSibling
+                            if (!appendTimedCell(element, visible)) {
+                                val before = cells.size
+                                element.childNodesList().forEach(::visitOriginalNode)
+                                if (cells.size == before && element.attr("begin") == null) {
+                                    // Child traversal already appended text nodes; no extra work needed.
+                                }
                             }
                         }
                     }
@@ -120,13 +205,99 @@ internal object TtmlLyricsParser {
             }
         }
 
-        var child = paragraph.firstChild
-        while (child != null) {
-            append(child)
-            child = child.nextSibling
+        paragraph.childNodesList().forEach(::visitOriginalNode)
+
+        if (cells.isNotEmpty() && original.isNotEmpty()) {
+            val pending = normalizeTtmlText(original.toString())
+            if (!pending.isFormattingWhitespaceFrom(original.toString())) {
+                val anchor = cells.lastOrNull()?.endTimeMs ?: fallbackEnd
+                cells += LyricCell(anchor, anchor, pending, timed = false)
+            }
+            original.clear()
         }
-        return RenderedParagraph(text.toString(), cues)
+
+        val finalOriginal = if (cells.isNotEmpty()) {
+            cells.joinToString(separator = "") { it.text }
+        } else {
+            normalizeTtmlText(original.toString(), trimEdges = true)
+        }
+        val finalCells = cells.ifEmpty {
+            if (finalOriginal.isBlank()) {
+                emptyList()
+            } else {
+                listOf(LyricCell(fallbackStart, fallbackEnd.coerceAtLeast(fallbackStart), finalOriginal, timed = false))
+            }
+        }
+        return ParsedParagraph(
+            visibleText = finalOriginal,
+            translationText = normalizeTtmlText(translation.toString(), trimEdges = true),
+            romanizationText = normalizeTtmlText(romanization.toString(), trimEdges = true),
+            cells = finalCells,
+        )
     }
+
+    private fun parseMetadataTranslations(root: Element): List<KeyedLine> =
+        root.elementsByLocalName("translation").flatMap { translation ->
+            translation.childElementsByLocalName("text").mapNotNull { text ->
+                val key = text.attr("for") ?: return@mapNotNull null
+                val value = normalizeTtmlText(text.textContent.orEmpty(), trimEdges = true)
+                textOnlyLine(value, 0, 0, key)?.let { KeyedLine(it, key) }
+            }
+        }
+
+    private fun lineFromCells(startTimeMs: Int, endTimeMs: Int, cells: List<LyricCell>): LyricLine? {
+        val cleanCells = cells.filter { it.text.isNotEmpty() }
+        val mainText = MetadataTextFix.normalize(cleanCells.joinToString(separator = "") { it.text }).trim()
+        if (mainText.isEmpty()) return null
+        val safeEnd = endTimeMs.coerceAtLeast(startTimeMs)
+        val boundedCells = cleanCells.mapIndexed { index, cell ->
+            val end = if (index == cleanCells.lastIndex) {
+                cell.endTimeMs.coerceAtMost(safeEnd).coerceAtLeast(cell.startTimeMs)
+            } else {
+                cell.endTimeMs.coerceAtLeast(cell.startTimeMs)
+            }
+            cell.copy(endTimeMs = end)
+        }
+        val cues = boundedCells
+            .filter { it.timed && it.text.isNotEmpty() }
+            .map { LyricCue(it.startTimeMs, it.text) }
+        return LyricLine(
+            timeMs = startTimeMs,
+            text = mainText,
+            cues = cues,
+            endTimeMs = safeEnd,
+            cells = boundedCells,
+        )
+    }
+
+    private fun textOnlyLine(text: String, startTimeMs: Int, endTimeMs: Int, key: String?): LyricLine? {
+        val normalized = MetadataTextFix.normalize(text).trim()
+        if (normalized.isEmpty()) return null
+        val safeEnd = endTimeMs.coerceAtLeast(startTimeMs)
+        return LyricLine(
+            timeMs = startTimeMs,
+            text = normalized,
+            endTimeMs = safeEnd,
+            cells = listOf(LyricCell(startTimeMs, safeEnd, normalized, timed = false)),
+        )
+    }
+
+    private fun LyricLine.withCompanionText(translation: String?, romanization: String?): LyricLine {
+        val cleanTranslation = translation?.let { MetadataTextFix.normalize(it).trim() }?.takeIf { it.isNotBlank() }
+        val cleanRomanization = romanization?.let { MetadataTextFix.normalize(it).trim() }?.takeIf { it.isNotBlank() }
+        return copy(
+            text = displayText(mainText, cleanRomanization, cleanTranslation),
+            subText = cleanTranslation,
+            romanizationText = cleanRomanization,
+        )
+    }
+
+    private fun displayText(mainText: String, romanizationText: String?, subText: String?): String =
+        buildList {
+            add(mainText)
+            romanizationText?.takeIf { it.isNotBlank() }?.let(::add)
+            subText?.takeIf { it.isNotBlank() }?.let(::add)
+        }.joinToString("\n")
 
     private fun parseTime(raw: String?): Int? {
         val value = raw?.trim().orEmpty()
@@ -148,4 +319,45 @@ internal object TtmlLyricsParser {
         }
         return millis.roundToInt()
     }
+
+    private fun Element.attr(localName: String, namespace: String? = null): String? {
+        if (namespace != null) {
+            getAttributeNS(namespace, localName).takeIf { it.isNotBlank() }?.let { return it }
+        }
+        getAttribute(localName).takeIf { it.isNotBlank() }?.let { return it }
+        for (index in 0 until attributes.length) {
+            val attr = attributes.item(index)
+            if (attr.localName == localName || attr.nodeName.endsWith(":$localName")) {
+                return attr.nodeValue
+            }
+        }
+        return null
+    }
+
+    private fun Element.elementsByLocalName(localName: String): List<Element> {
+        val result = mutableListOf<Element>()
+        fun visit(node: Node) {
+            if (node is Element && node.localName == localName) result += node
+            node.childNodesList().forEach(::visit)
+        }
+        visit(this)
+        return result
+    }
+
+    private fun Element.childElementsByLocalName(localName: String): List<Element> =
+        childNodesList().filterIsInstance<Element>().filter { it.localName == localName }
+
+    private fun Node.childNodesList(): List<Node> =
+        (0 until childNodes.length).map { childNodes.item(it) }
+
+    private fun normalizeTtmlText(text: String, trimEdges: Boolean = false): String {
+        if (!text.contains('\n') && !text.contains('\r')) {
+            return if (trimEdges) text.trim() else text
+        }
+        val collapsed = text.replace(Regex("\\s+"), " ")
+        return if (trimEdges) collapsed.trim() else collapsed
+    }
+
+    private fun String.isFormattingWhitespaceFrom(rawText: String): Boolean =
+        isEmpty() || (isBlank() && (rawText.contains('\n') || rawText.contains('\r')))
 }

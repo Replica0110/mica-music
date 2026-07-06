@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.PlaylistPlay
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Album
 import androidx.compose.material.icons.outlined.Analytics
@@ -136,7 +137,7 @@ fun HomeDrawerPanel(
                         selectedSection == HomeSection.Playlist && activePlaylistId == playlist.id
                     DrawerNavItem(
                         label = playlist.name,
-                        icon = Icons.Outlined.PlaylistPlay,
+                        icon = Icons.AutoMirrored.Outlined.PlaylistPlay,
                         selected = selected,
                         onClick = { onPlaylistSelected(playlist.id) },
                     )

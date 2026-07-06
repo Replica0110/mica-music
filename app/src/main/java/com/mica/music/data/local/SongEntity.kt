@@ -2,6 +2,7 @@ package com.mica.music.data.local
 
 import androidx.room.Entity
 import androidx.room.PrimaryKey
+import com.mica.music.data.LyricCell
 import com.mica.music.data.LyricLine
 import com.mica.music.data.LyricCue
 import com.mica.music.data.Song
@@ -150,6 +151,22 @@ private fun encodeLyrics(lines: List<LyricLine>): String {
         val encoded = JSONObject()
                 .put("t", line.timeMs)
                 .put("x", line.text)
+        line.endTimeMs?.let { encoded.put("e", it) }
+        if (line.cells.isNotEmpty()) {
+            val cells = JSONArray()
+            line.cells.forEach { cell ->
+                cells.put(
+                    JSONObject()
+                        .put("s", cell.startTimeMs)
+                        .put("e", cell.endTimeMs)
+                        .put("x", cell.text)
+                        .put("timed", cell.timed),
+                )
+            }
+            encoded.put("cells", cells)
+        }
+        line.subText?.takeIf { it.isNotBlank() }?.let { encoded.put("sub", it) }
+        line.romanizationText?.takeIf { it.isNotBlank() }?.let { encoded.put("rom", it) }
         if (line.cues.isNotEmpty()) {
             val cues = JSONArray()
             line.cues.forEach { cue ->
@@ -178,7 +195,33 @@ private fun decodeLyrics(json: String): List<LyricLine> {
                         }
                     }
                 }.orEmpty()
-                add(LyricLine(timeMs = obj.getInt("t"), text = obj.getString("x"), cues = cues))
+                val cells = obj.optJSONArray("cells")?.let { cellArray ->
+                    buildList(cellArray.length()) {
+                        for (cellIndex in 0 until cellArray.length()) {
+                            val cell = cellArray.optJSONObject(cellIndex) ?: continue
+                            if (!cell.has("s") || !cell.has("e") || !cell.has("x")) continue
+                            add(
+                                LyricCell(
+                                    startTimeMs = cell.getInt("s"),
+                                    endTimeMs = cell.getInt("e"),
+                                    text = cell.getString("x"),
+                                    timed = cell.optBoolean("timed", true),
+                                ),
+                            )
+                        }
+                    }
+                }.orEmpty()
+                add(
+                    LyricLine(
+                        timeMs = obj.getInt("t"),
+                        text = obj.getString("x"),
+                        cues = cues,
+                        endTimeMs = obj.takeIf { it.has("e") }?.getInt("e"),
+                        cells = cells,
+                        subText = obj.optString("sub").takeIf { it.isNotBlank() },
+                        romanizationText = obj.optString("rom").takeIf { it.isNotBlank() },
+                    ),
+                )
             }
         }
     }.getOrDefault(emptyList())

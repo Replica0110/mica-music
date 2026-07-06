@@ -115,6 +115,7 @@ class DsdDecimationAudioProcessor(
     override fun isEnded(): Boolean =
         inputEnded && pendingSize == 0 && outputBuffer === AudioProcessor.EMPTY_BUFFER
 
+    @Deprecated("Deprecated in Java")
     override fun flush() {
         outputBuffer = AudioProcessor.EMPTY_BUFFER
         pendingSize = 0

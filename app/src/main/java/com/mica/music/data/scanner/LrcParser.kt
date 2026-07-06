@@ -1,114 +1,106 @@
 package com.mica.music.data.scanner
 
-import com.mica.music.data.LyricLine
+import com.mica.music.data.LyricCell
 import com.mica.music.data.LyricCue
+import com.mica.music.data.LyricLine
 
 internal object LrcParser {
 
-    private val timestamp = Regex("""\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]""")
-    private val cueTimestamp = Regex("""<(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?>""")
+    private const val DEFAULT_CELL_DURATION_MS = 2_000
+    private const val DEFAULT_LINE_DURATION_MS = 5_000
+
+    private val bracketTimestamp = Regex("""\[(\d{1,3}):(\d{2})(?::(\d{2}))?(?:[.:](\d{1,3}))?\]""")
+    private val angleTimestamp = Regex("""<(\d{1,3}):(\d{2})(?::(\d{2}))?(?:[.:](\d{1,3}))?>""")
     private val offsetTag = Regex("""(?i)\[offset:\s*([+-]?\d+)\s*\]""")
     private val tagLine = Regex("""\[[^:\]]+:[^\]]*\]""")
     private val kugouLine = Regex("""^\[(\d+),(\d+)](.*)$""")
     private val kugouCue = Regex("""<(\d+),(\d+),(\d+)>([^<]*)""")
-    /** NetEase/QQ embedded word-lyric line prefix, e.g. `v1: `. */
     private val leadingVersionMarkerCue = Regex("""(?i)^v\d+:\s*$""")
     private val leadingVersionMarkerText = Regex("""(?i)^v\d+:\s*""")
 
     fun parse(text: String): List<LyricLine> {
         if (TtmlLyricsParser.looksLikeTtml(text)) return TtmlLyricsParser.parse(text)
-        val lines = text.lines()
-        val offsetMs = lines.firstNotNullOfOrNull { line ->
+
+        val sourceLines = text.lines()
+        val offsetMs = sourceLines.firstNotNullOfOrNull { line ->
             offsetTag.find(line)?.groupValues?.get(1)?.toIntOrNull()
         } ?: 0
-        val timed = mutableListOf<LyricLine>()
-        for (line in lines) {
-            val trimmed = line.trim()
+        val parsedLines = mutableListOf<LyricLine>()
+
+        for (rawLine in sourceLines) {
+            val trimmed = rawLine.trim()
             if (trimmed.isEmpty()) continue
-            parseKugouLine(trimmed, offsetMs)?.let {
-                timed += it
+
+            parseKugouLine(trimmed, offsetMs)?.let { line ->
+                if (shouldKeepParsedLine(line)) parsedLines += line
                 continue
             }
-            val matches = timestamp.findAll(trimmed).toList()
-            parseInlineBracketLine(trimmed, matches, offsetMs)?.let { parsed ->
-                if (shouldKeepParsedLine(parsed)) {
-                    timed += parsed
+
+            val matches = bracketTimestamp.findAll(trimmed).toList()
+            val leadingMatches = leadingTimestampMatches(matches)
+            if (leadingMatches.isNotEmpty() && leadingMatches.size == matches.size) {
+                val body = trimmed.substring(leadingMatches.last().range.last + 1)
+                leadingMatches.forEach { match ->
+                    val lineTimeMs = (timestampMs(match) + offsetMs).coerceAtLeast(0)
+                    parseEnhancedBody(body, lineTimeMs, offsetMs)?.let { line ->
+                        if (shouldKeepParsedLine(line)) parsedLines += line
+                    }
+                }
+                continue
+            }
+
+            parseInlineBracketLine(trimmed, matches, offsetMs)?.let { line ->
+                if (shouldKeepParsedLine(line)) {
+                    parsedLines += line
                     continue
                 }
             }
-            val hasLeadingTimestamps = matches.isNotEmpty() &&
-                matches.first().range.first == 0 &&
-                matches.zipWithNext().all { (left, right) -> right.range.first == left.range.last + 1 }
-            if (hasLeadingTimestamps) {
-                val body = trimmed.substring(matches.last().range.last + 1)
-                matches.forEach { match ->
-                    val lineTimeMs = timestampMs(match) + offsetMs
-                    val parsedBody = parseEnhancedBody(body, lineTimeMs, offsetMs)
-                    if (parsedBody.text.isNotEmpty() && shouldKeepParsedLine(parsedBody.toLyricLine(lineTimeMs))) {
-                        timed += LyricLine(
-                            timeMs = lineTimeMs.coerceAtLeast(0),
-                            text = parsedBody.text,
-                            cues = parsedBody.cues,
-                        )
-                    }
-                }
-                continue
-            }
-            if (!trimmed.startsWith("[") && !LyricsSanitizer.isPlaceholderLyric(trimmed) &&
+
+            if (!trimmed.startsWith("[") &&
+                !LyricsSanitizer.isPlaceholderLyric(trimmed) &&
                 !LyricsSanitizer.isBinaryGarbage(trimmed)
             ) {
-                timed += LyricLine(timeMs = 0, text = MetadataTextFix.normalize(trimmed))
+                timedLine(
+                    startTimeMs = 0,
+                    endTimeMs = DEFAULT_LINE_DURATION_MS,
+                    cells = listOf(LyricCell(0, DEFAULT_LINE_DURATION_MS, MetadataTextFix.normalize(trimmed), false)),
+                )?.let { parsedLines += it }
             }
         }
-        if (timed.isEmpty()) {
-            val plain = text.lines()
+
+        val parsed = if (parsedLines.isNotEmpty()) {
+            parsedLines
+        } else {
+            text.lines()
                 .map { it.trim() }
                 .filter {
-                    it.isNotEmpty() && !tagLine.matches(it) && !LyricsSanitizer.isPlaceholderLyric(it) &&
+                    it.isNotEmpty() &&
+                        !tagLine.matches(it) &&
+                        !LyricsSanitizer.isPlaceholderLyric(it) &&
                         !LyricsSanitizer.isBinaryGarbage(it)
                 }
-                .map { MetadataTextFix.normalize(it) }
-            if (plain.isNotEmpty()) {
-                return plain.map { LyricLine(timeMs = 0, it) }
-            }
-        }
-        return mergeSameTimestampWordTranslationLines(timed)
-    }
-
-    private data class ParsedBody(val text: String, val cues: List<LyricCue>) {
-        fun toLyricLine(lineTimeMs: Int): LyricLine = LyricLine(lineTimeMs, text, cues)
-    }
-
-    private fun mergeSameTimestampWordTranslationLines(lines: List<LyricLine>): List<LyricLine> {
-        if (lines.size < 2) return lines.sortedBy { it.timeMs }
-        val sorted = lines.sortedBy { it.timeMs }
-        return buildList {
-            var index = 0
-            while (index < sorted.size) {
-                val group = sorted.drop(index).takeWhile { it.timeMs == sorted[index].timeMs }
-                if (group.size == 2) {
-                    val wordLine = group.singleOrNull { it.cues.isNotEmpty() }
-                    val translationLine = group.singleOrNull { it.cues.isEmpty() }
-                    if (wordLine != null && translationLine != null) {
-                        add(
-                            wordLine.copy(
-                                text = "${wordLine.text}\n${translationLine.text}",
-                            ),
-                        )
-                        index += group.size
-                        continue
-                    }
+                .mapNotNull { plain ->
+                    timedLine(
+                        startTimeMs = 0,
+                        endTimeMs = DEFAULT_LINE_DURATION_MS,
+                        cells = listOf(LyricCell(0, DEFAULT_LINE_DURATION_MS, MetadataTextFix.normalize(plain), false)),
+                    )
                 }
-                addAll(group)
-                index += group.size
-            }
         }
+
+        return mergeSameTimestampTracks(clampLineEnds(parsed))
     }
 
-    private fun shouldKeepParsedLine(line: LyricLine): Boolean {
-        if (LyricsSanitizer.isPlaceholderLyric(line.text)) return false
-        if (line.cues.isNotEmpty()) return true
-        return !LyricsSanitizer.isBinaryGarbage(line.text)
+    private fun leadingTimestampMatches(matches: List<MatchResult>): List<MatchResult> {
+        if (matches.isEmpty() || matches.first().range.first != 0) return emptyList()
+        val leading = mutableListOf<MatchResult>()
+        var expectedStart = 0
+        for (match in matches) {
+            if (match.range.first != expectedStart) break
+            leading += match
+            expectedStart = match.range.last + 1
+        }
+        return leading
     }
 
     /** [00:00.000]字[00:00.022]词 — common in NetEase/QQ embedded word lyrics. */
@@ -118,140 +110,226 @@ internal object LrcParser {
         offsetMs: Int,
     ): LyricLine? {
         if (matches.size < 2 || matches.first().range.first != 0) return null
-        if (matches.zipWithNext().all { (left, right) -> right.range.first == left.range.last + 1 }) return null
+        val leading = leadingTimestampMatches(matches)
+        if (leading.size == matches.size) return null
 
         val lineTimeMs = (timestampMs(matches.first()) + offsetMs).coerceAtLeast(0)
-        val textBuilder = StringBuilder()
-        val cues = mutableListOf<LyricCue>()
-        matches.forEachIndexed { index, match ->
+        val cells = matches.mapIndexedNotNull { index, match ->
             val fragmentStart = match.range.last + 1
             val fragmentEnd = matches.getOrNull(index + 1)?.range?.first ?: trimmed.length
-            val cueText = MetadataTextFix.normalizeFragment(trimmed.substring(fragmentStart, fragmentEnd))
-            if (cueText.isEmpty()) return@forEachIndexed
-            textBuilder.append(cueText)
-            cues += LyricCue((timestampMs(match) + offsetMs).coerceAtLeast(0), cueText)
+            val fragment = MetadataTextFix.normalizeFragment(trimmed.substring(fragmentStart, fragmentEnd))
+            if (fragment.isEmpty()) return@mapIndexedNotNull null
+            val start = (timestampMs(match) + offsetMs).coerceAtLeast(0)
+            val end = matches.getOrNull(index + 1)
+                ?.let { (timestampMs(it) + offsetMs).coerceAtLeast(start) }
+                ?: (start + DEFAULT_CELL_DURATION_MS)
+            LyricCell(start, end, fragment)
         }
-        val normalizedText = MetadataTextFix.normalize(textBuilder.toString()).trim()
-        if (normalizedText.isEmpty()) return null
-        return finalizeTimedLine(
-            lineTimeMs = lineTimeMs,
-            text = normalizedText,
-            cues = validateCues(cues, lineTimeMs, normalizedText),
-        )
+        if (cells.isEmpty()) return null
+        return timedLine(lineTimeMs, cells.last().endTimeMs, stripLeadingVersionMarker(cells, lineTimeMs))
     }
 
-    private fun finalizeTimedLine(lineTimeMs: Int, text: String, cues: List<LyricCue>): LyricLine {
-        val stripped = stripLeadingVersionMarker(text, cues, lineTimeMs)
-        return LyricLine(
-            timeMs = lineTimeMs,
-            text = stripped.text,
-            cues = stripped.cues,
-        )
-    }
-
-    private fun stripLeadingVersionMarker(
-        text: String,
-        cues: List<LyricCue>,
-        lineTimeMs: Int,
-    ): ParsedBody {
-        var workingCues = cues.dropWhile { leadingVersionMarkerCue.matches(it.text.trim()) }.toMutableList()
-        if (workingCues.isNotEmpty()) {
-            val first = workingCues.first()
-            val strippedFirst = leadingVersionMarkerText.replaceFirst(first.text, "")
-            if (strippedFirst.isEmpty()) {
-                workingCues.removeAt(0)
-            } else if (strippedFirst != first.text) {
-                workingCues[0] = first.copy(text = strippedFirst)
-            }
-        }
-        val resolvedText = if (workingCues.isNotEmpty()) {
-            MetadataTextFix.normalize(workingCues.joinToString(separator = "") { it.text }).trim()
-        } else {
-            leadingVersionMarkerText.replaceFirst(text, "").trim()
-        }
-        if (resolvedText.isEmpty()) return ParsedBody(text, cues)
-        val resolvedCues = if (workingCues.isNotEmpty()) {
-            validateCues(workingCues, lineTimeMs, resolvedText)
-        } else {
-            emptyList()
-        }
-        return ParsedBody(resolvedText, resolvedCues)
-    }
-
-    private fun parseEnhancedBody(body: String, lineTimeMs: Int, offsetMs: Int): ParsedBody {
-        val matches = cueTimestamp.findAll(body).toList()
+    private fun parseEnhancedBody(body: String, lineTimeMs: Int, offsetMs: Int): LyricLine? {
+        val matches = angleTimestamp.findAll(body).toList()
         if (matches.isEmpty()) {
             val normalized = MetadataTextFix.normalize(body).trim()
-            return stripLeadingVersionMarker(normalized, emptyList(), lineTimeMs)
+            if (normalized.isEmpty()) return null
+            val clean = leadingVersionMarkerText.replaceFirst(normalized, "").trim()
+            if (clean.isEmpty()) return null
+            return timedLine(
+                startTimeMs = lineTimeMs,
+                endTimeMs = lineTimeMs + DEFAULT_LINE_DURATION_MS,
+                cells = listOf(LyricCell(lineTimeMs, lineTimeMs + DEFAULT_LINE_DURATION_MS, clean, timed = false)),
+            )
         }
 
-        val plain = buildString {
-            var cursor = 0
-            matches.forEach { match ->
-                append(body.substring(cursor, match.range.first))
-                cursor = match.range.last + 1
-            }
-            append(body.substring(cursor))
+        val cells = mutableListOf<LyricCell>()
+        val firstTimedStart = (timestampMs(matches.first()) + offsetMs).coerceAtLeast(0)
+        val prefix = body.substring(0, matches.first().range.first)
+        val normalizedPrefix = MetadataTextFix.normalizeFragment(prefix)
+        if (normalizedPrefix.isNotEmpty() && normalizedPrefix.isNotBlank()) {
+            cells += LyricCell(lineTimeMs, firstTimedStart.coerceAtLeast(lineTimeMs), normalizedPrefix, timed = false)
         }
-        val cues = matches.mapIndexedNotNull { index, match ->
-            val start = match.range.last + 1
-            val end = matches.getOrNull(index + 1)?.range?.first ?: body.length
-            val cueText = MetadataTextFix.normalizeFragment(body.substring(start, end))
-            cueText.takeIf { it.isNotEmpty() }?.let {
-                LyricCue((timestampMs(match) + offsetMs).coerceAtLeast(0), it)
-            }
+
+        matches.forEachIndexed { index, match ->
+            val start = (timestampMs(match) + offsetMs).coerceAtLeast(0)
+            val textStart = match.range.last + 1
+            val textEnd = matches.getOrNull(index + 1)?.range?.first ?: body.length
+            val fragment = MetadataTextFix.normalizeFragment(body.substring(textStart, textEnd))
+            if (fragment.isEmpty()) return@forEachIndexed
+            val end = matches.getOrNull(index + 1)
+                ?.let { (timestampMs(it) + offsetMs).coerceAtLeast(start) }
+                ?: (start + DEFAULT_CELL_DURATION_MS)
+            cells += LyricCell(start, end, fragment)
         }
-        val normalizedText = MetadataTextFix.normalize(plain).trim()
-        return stripLeadingVersionMarker(
-            normalizedText,
-            validateCues(cues, lineTimeMs, normalizedText),
-            lineTimeMs,
-        )
+        if (cells.isEmpty()) return null
+        return timedLine(lineTimeMs, cells.last().endTimeMs, stripLeadingVersionMarker(cells, lineTimeMs))
     }
 
     private fun parseKugouLine(line: String, offsetMs: Int): LyricLine? {
         val match = kugouLine.matchEntire(line) ?: return null
         val sourceLineStart = match.groupValues[1].toLongOrNull() ?: return null
-        val lineStart = (sourceLineStart + offsetMs).coerceAtLeast(0).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+        val lineDuration = match.groupValues[2].toLongOrNull() ?: DEFAULT_LINE_DURATION_MS.toLong()
+        val lineStart = (sourceLineStart + offsetMs).coerceToInt()
+        val lineEnd = (sourceLineStart + lineDuration + offsetMs).coerceToInt().coerceAtLeast(lineStart)
         val body = match.groupValues[3]
-        val cueMatches = kugouCue.findAll(body).toList()
-        if (cueMatches.isEmpty()) return null
-        val text = MetadataTextFix.normalize(
-            cueMatches.joinToString(separator = "") { it.groupValues[4] },
-        ).trim()
-        val cues = cueMatches.mapNotNull { cue ->
+        val cells = kugouCue.findAll(body).mapNotNull { cue ->
             val relative = cue.groupValues[1].toLongOrNull() ?: return@mapNotNull null
-            val cueTime = (sourceLineStart + relative + offsetMs)
-                .coerceAtLeast(0)
-                .coerceAtMost(Int.MAX_VALUE.toLong())
-                .toInt()
-            val cueText = MetadataTextFix.normalizeFragment(cue.groupValues[4])
-            cueText.takeIf { it.isNotEmpty() }?.let { LyricCue(cueTime, it) }
+            val duration = cue.groupValues[2].toLongOrNull() ?: 0L
+            val start = (sourceLineStart + relative + offsetMs).coerceToInt().coerceAtLeast(lineStart)
+            val end = (sourceLineStart + relative + duration + offsetMs).coerceToInt().coerceAtLeast(start)
+            val text = MetadataTextFix.normalizeFragment(cue.groupValues[4])
+            text.takeIf { it.isNotEmpty() }?.let { LyricCell(start, end, it) }
+        }.toList()
+        if (cells.isEmpty()) return null
+        return timedLine(lineStart, lineEnd.coerceAtLeast(cells.last().endTimeMs), stripLeadingVersionMarker(cells, lineStart))
+    }
+
+    private fun stripLeadingVersionMarker(cells: List<LyricCell>, lineTimeMs: Int): List<LyricCell> {
+        val working = cells.dropWhile { leadingVersionMarkerCue.matches(it.text.trim()) }.toMutableList()
+        if (working.isNotEmpty()) {
+            val first = working.first()
+            val stripped = leadingVersionMarkerText.replaceFirst(first.text, "")
+            if (stripped.isEmpty()) {
+                working.removeAt(0)
+            } else if (stripped != first.text) {
+                working[0] = first.copy(text = stripped, startTimeMs = first.startTimeMs.coerceAtLeast(lineTimeMs))
+            }
         }
-        return text.takeIf { it.isNotEmpty() }?.let {
-            finalizeTimedLine(lineStart, it, validateCues(cues, lineStart, text))
+        return working
+    }
+
+    private fun timedLine(
+        startTimeMs: Int,
+        endTimeMs: Int,
+        cells: List<LyricCell>,
+        subText: String? = null,
+        romanizationText: String? = null,
+    ): LyricLine? {
+        val cleanCells = cells.filter { it.text.isNotEmpty() }
+        val mainText = MetadataTextFix.normalize(cleanCells.joinToString(separator = "") { it.text }).trim()
+        if (mainText.isEmpty()) return null
+        val safeEnd = endTimeMs.coerceAtLeast(startTimeMs)
+        val boundedCells = cleanCells.mapIndexed { index, cell ->
+            val cellEnd = if (index == cleanCells.lastIndex) {
+                cell.endTimeMs.coerceAtMost(safeEnd).coerceAtLeast(cell.startTimeMs)
+            } else {
+                cell.endTimeMs.coerceAtLeast(cell.startTimeMs)
+            }
+            cell.copy(endTimeMs = cellEnd)
+        }
+        val cues = boundedCells
+            .filter { it.timed && it.text.isNotEmpty() }
+            .map { LyricCue(it.startTimeMs, it.text) }
+        val translation = subText?.let { MetadataTextFix.normalize(it).trim() }?.takeIf { it.isNotEmpty() }
+        val romanization = romanizationText?.let { MetadataTextFix.normalize(it).trim() }?.takeIf { it.isNotEmpty() }
+        return LyricLine(
+            timeMs = startTimeMs,
+            text = displayText(mainText, romanization, translation),
+            cues = cues,
+            endTimeMs = safeEnd,
+            cells = boundedCells,
+            subText = translation,
+            romanizationText = romanization,
+        )
+    }
+
+    private fun clampLineEnds(lines: List<LyricLine>): List<LyricLine> {
+        if (lines.size < 2) return lines.sortedBy { it.timeMs }
+        val sorted = lines.sortedBy { it.timeMs }
+        return sorted.mapIndexed { index, line ->
+            val nextStart = sorted.asSequence()
+                .drop(index + 1)
+                .firstOrNull { it.timeMs > line.timeMs }
+                ?.timeMs
+                ?: return@mapIndexed line
+            val end = line.endTimeMs ?: return@mapIndexed line.copy(endTimeMs = nextStart)
+            if (end > nextStart || end <= line.timeMs) {
+                line.withEndTime(nextStart)
+            } else {
+                line
+            }
         }
     }
 
-    private fun validateCues(cues: List<LyricCue>, lineTimeMs: Int, lineText: String): List<LyricCue> {
-        if (cues.isEmpty() || cues.first().timeMs < lineTimeMs) return emptyList()
-        if (cues.zipWithNext().any { (left, right) -> right.timeMs < left.timeMs }) return emptyList()
-        val visibleCueText = cues.joinToString(separator = "") { it.text }.trim()
-        return cues.takeIf { visibleCueText.isNotEmpty() && lineText.contains(visibleCueText, ignoreCase = false) }
-            ?: cues.takeIf { visibleCueText == lineText }
-            ?: emptyList()
+    private fun mergeSameTimestampTracks(lines: List<LyricLine>): List<LyricLine> {
+        if (lines.size < 2 || lines.none { it.timeMs > 0 }) return lines.sortedBy { it.timeMs }
+        val grouped = lines.sortedBy { it.timeMs }.groupBy { it.timeMs }.toSortedMap()
+        return buildList {
+            grouped.values.forEach { group ->
+                if (group.size == 1) {
+                    add(group.single())
+                    return@forEach
+                }
+
+                val original = when {
+                    group.size == 2 -> group.firstOrNull { it.hasKaraokeCells() } ?: group.first()
+                    else -> group.first()
+                }
+                val companions = group.filterNot { it === original }
+                val romanization = if (companions.size >= 2) companions.first().mainText else null
+                val translation = when {
+                    companions.size >= 2 -> companions.drop(1).joinToString("\n") { it.mainText }
+                    companions.size == 1 -> companions.single().mainText
+                    else -> null
+                }
+                add(
+                    original.copy(
+                        text = displayText(original.mainText, romanization, translation),
+                        subText = translation?.takeIf { it.isNotBlank() },
+                        romanizationText = romanization?.takeIf { it.isNotBlank() },
+                    ),
+                )
+            }
+        }
+    }
+
+    private fun LyricLine.withEndTime(endTimeMs: Int): LyricLine {
+        val boundedCells = cells.mapIndexed { index, cell ->
+            if (index == cells.lastIndex && cell.endTimeMs > endTimeMs) {
+                cell.copy(endTimeMs = endTimeMs.coerceAtLeast(cell.startTimeMs))
+            } else {
+                cell
+            }
+        }
+        return copy(endTimeMs = endTimeMs, cells = boundedCells)
+    }
+
+    private fun LyricLine.hasKaraokeCells(): Boolean =
+        cells.count { it.timed } > 1 || cues.size > 1
+
+    private fun shouldKeepParsedLine(line: LyricLine): Boolean {
+        if (LyricsSanitizer.isPlaceholderLyric(line.text)) return false
+        if (line.cells.isNotEmpty() || line.cues.isNotEmpty()) return true
+        return !LyricsSanitizer.isBinaryGarbage(line.text)
     }
 
     private fun timestampMs(match: MatchResult): Int {
-        val min = match.groupValues[1].toIntOrNull() ?: 0
-        val sec = match.groupValues[2].toIntOrNull() ?: 0
-        val frac = match.groupValues[3]
-        val fractionMs = when (frac.length) {
-            3 -> frac.toIntOrNull() ?: 0
-            2 -> (frac.toIntOrNull() ?: 0) * 10
-            1 -> (frac.toIntOrNull() ?: 0) * 100
+        val first = match.groupValues[1].toIntOrNull() ?: 0
+        val second = match.groupValues[2].toIntOrNull() ?: 0
+        val third = match.groupValues.getOrNull(3)?.takeIf { it.isNotBlank() }?.toIntOrNull()
+        val fraction = match.groupValues.getOrNull(4).orEmpty()
+        val fractionMs = when (fraction.length) {
+            3 -> fraction.toIntOrNull() ?: 0
+            2 -> (fraction.toIntOrNull() ?: 0) * 10
+            1 -> (fraction.toIntOrNull() ?: 0) * 100
             else -> 0
         }
-        return min * 60_000 + sec * 1_000 + fractionMs
+        val totalSeconds = if (third == null) {
+            first * 60 + second
+        } else {
+            first * 3_600 + second * 60 + third
+        }
+        return totalSeconds * 1_000 + fractionMs
     }
+
+    private fun Long.coerceToInt(): Int =
+        coerceAtLeast(0).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+
+    private fun displayText(mainText: String, romanizationText: String?, subText: String?): String =
+        buildList {
+            add(mainText)
+            romanizationText?.takeIf { it.isNotBlank() }?.let(::add)
+            subText?.takeIf { it.isNotBlank() }?.let(::add)
+        }.joinToString("\n")
 }

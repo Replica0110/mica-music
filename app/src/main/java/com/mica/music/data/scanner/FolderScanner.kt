@@ -317,7 +317,7 @@ object FolderScanner {
         audioOut: MutableList<AudioFileEntry>,
         lyricOut: MutableList<LyricFileEntry>,
     ) {
-        val children = dir.listFiles() ?: return
+        val children = dir.listFiles()
         for (child in children) {
             val name = child.name ?: continue
             if (child.isDirectory) {

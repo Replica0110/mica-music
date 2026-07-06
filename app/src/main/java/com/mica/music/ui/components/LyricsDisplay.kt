@@ -30,15 +30,24 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.lerp as lerpColor
+import androidx.compose.ui.layout.AlignmentLine
+import androidx.compose.ui.layout.FirstBaseline
+import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.lerp as lerpTextUnit
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.mica.music.data.LyricDisplayRows
+import com.mica.music.data.LyricCell
 import com.mica.music.data.LyricLine
 import com.mica.music.data.LyricsBilingualDisplayMode
 import com.mica.music.data.LyricsSync
@@ -49,6 +58,7 @@ import com.mica.music.ui.theme.LocalLyricLineFillEnabled
 import com.mica.music.ui.theme.LocalLyricSplitEnabled
 import com.mica.music.ui.theme.MicaTheme
 import com.mica.music.ui.theme.PlayerContentColors
+import kotlin.math.roundToInt
 
 private const val LYRIC_LINE_PLACEHOLDER = "\u00A0"
 private const val LyricFillFallbackDurationMs = 2_500
@@ -226,18 +236,17 @@ fun LyricLineBlock(
     translationTextStyle: TextStyle = textStyle,
 ) {
     val lyricSplitEnabled = LocalLyricSplitEnabled.current
-    val lyricLineFillEnabled = LocalLyricLineFillEnabled.current
-    val rows = LyricDisplayRows.rowsForBilingualDisplayMode(
-        text = text.orEmpty(),
-        enabled = lyricSplitEnabled,
-        mode = bilingualDisplayMode,
-    )
+    val rows = remember(text, lyricLine, nextLineTimeMs, lyricSplitEnabled, bilingualDisplayMode) {
+        lyricRenderRows(
+            text = text.orEmpty(),
+            line = lyricLine,
+            nextLineTimeMs = nextLineTimeMs,
+            splitEnabled = lyricSplitEnabled,
+            mode = bilingualDisplayMode,
+        )
+    }
     val bilingualGap = if (rows.size > 1) HifiSpacing.lyricBilingualGap else 0.dp
-    val cueRanges = remember(lyricLine) { lyricLine?.let(::lyricCueRanges).orEmpty() }
-    val canFillLineTimed = lyricLineFillEnabled &&
-        lyricLine != null &&
-        (lyricLine.timeMs > 0 || nextLineTimeMs != null)
-    val shouldRunFillClock = isCurrent && lyricLine != null && (cueRanges.isNotEmpty() || canFillLineTimed)
+    val shouldRunFillClock = isCurrent && rows.any { it.hasKaraokeCells }
     val fillPositionMs = rememberLyricFrameClockPositionMs(
         anchorPositionMs = positionMs,
         isPlaying = isPlaying && shouldRunFillClock,
@@ -248,44 +257,14 @@ fun LyricLineBlock(
         verticalArrangement = Arrangement.spacedBy(bilingualGap),
     ) {
         rows.forEach { row ->
-            val rowHasCueRanges = cueRanges.any { it.overlaps(row) }
-            val rowTextStyle = if (row.splitIndex > 0) translationTextStyle else textStyle
-            if (cueRanges.isNotEmpty() && rowHasCueRanges) {
-                KaraokeLyricLineText(
+            val rowTextStyle = if (row.secondary) translationTextStyle else textStyle
+            if (isCurrent && row.hasKaraokeCells) {
+                KaraokeCharacterLineText(
                     text = row.text,
-                    isCurrent = isCurrent,
+                    cells = row.cells,
+                    currentTimeMs = fillPositionMs,
                     colors = colors,
                     textStyle = rowTextStyle,
-                    fillFraction = if (isCurrent && lyricLine != null) {
-                        wordSyncedFillFraction(
-                            line = lyricLine,
-                            row = row,
-                            cueRanges = cueRanges,
-                            positionMs = fillPositionMs,
-                            nextLineTimeMs = nextLineTimeMs,
-                        )
-                    } else {
-                        0f
-                    },
-                    maxLines = maxLines,
-                    textAlign = textAlign,
-                )
-            } else if (
-                isCurrent &&
-                canFillLineTimed
-            ) {
-                KaraokeLyricLineText(
-                    text = row.text,
-                    isCurrent = true,
-                    colors = colors,
-                    textStyle = rowTextStyle,
-                    fillFraction = lineTimedFillFraction(
-                        line = lyricLine,
-                        row = row,
-                        positionMs = fillPositionMs,
-                        nextLineTimeMs = nextLineTimeMs,
-                        syncDisplayRowFill = rows.size > 1,
-                    ),
                     maxLines = maxLines,
                     textAlign = textAlign,
                 )
@@ -302,6 +281,81 @@ fun LyricLineBlock(
             }
         }
     }
+}
+
+private data class LyricRenderRow(
+    val text: String,
+    val cells: List<LyricCell> = emptyList(),
+    val secondary: Boolean = false,
+) {
+    val hasKaraokeCells: Boolean
+        get() = cells.count { it.timed } > 1
+}
+
+private fun lyricRenderRows(
+    text: String,
+    line: LyricLine?,
+    nextLineTimeMs: Int?,
+    splitEnabled: Boolean,
+    mode: LyricsBilingualDisplayMode,
+): List<LyricRenderRow> {
+    if (line != null && line.hasStructuredText) {
+        val mainText = line.mainText.ifBlank { text.lineSequence().firstOrNull().orEmpty() }
+        val main = LyricRenderRow(text = mainText, cells = line.cells)
+        val romanization = line.romanizationText
+            ?.takeIf { it.isNotBlank() }
+            ?.let { LyricRenderRow(text = it, secondary = true) }
+        val translation = line.subText
+            ?.takeIf { it.isNotBlank() }
+            ?.let { LyricRenderRow(text = it, secondary = true) }
+        return when (mode) {
+            LyricsBilingualDisplayMode.ALL -> listOfNotNull(main, romanization, translation)
+            LyricsBilingualDisplayMode.ORIGINAL -> listOf(main)
+            LyricsBilingualDisplayMode.TRANSLATION -> listOfNotNull(translation, romanization).takeIf { it.isNotEmpty() }
+                ?: listOf(main)
+        }
+    }
+
+    val rows = LyricDisplayRows.rowsForBilingualDisplayMode(
+        text = text,
+        enabled = splitEnabled,
+        mode = mode,
+    )
+    val cueRanges = line?.let(::lyricCueRanges).orEmpty()
+    return rows.map { row ->
+        LyricRenderRow(
+            text = row.text,
+            cells = if (row.splitIndex == 0 && line != null) {
+                cellsForLegacyDisplayRow(line, row, cueRanges, nextLineTimeMs)
+            } else {
+                emptyList()
+            },
+            secondary = row.splitIndex > 0,
+        )
+    }.ifEmpty { listOf(LyricRenderRow(text = text)) }
+}
+
+private fun cellsForLegacyDisplayRow(
+    line: LyricLine,
+    row: LyricDisplayRows.DisplayRow,
+    cueRanges: List<LyricCueRange>,
+    nextLineTimeMs: Int?,
+): List<LyricCell> {
+    if (line.cues.isEmpty() || cueRanges.isEmpty()) return emptyList()
+    return cueRanges
+        .filter { it.overlaps(row) }
+        .mapNotNull { range ->
+            val cue = line.cues.getOrNull(range.cueIndex) ?: return@mapNotNull null
+            val end = line.cues.getOrNull(range.cueIndex + 1)?.timeMs
+                ?: nextLineTimeMs
+                ?: line.endTimeMs
+                ?: (cue.timeMs + LyricFillFallbackDurationMs)
+            LyricCell(
+                startTimeMs = cue.timeMs,
+                endTimeMs = end.coerceAtLeast(cue.timeMs),
+                text = cue.text,
+            )
+        }
 }
 
 private data class LyricCueRange(val cueIndex: Int, val start: Int, val endExclusive: Int)
@@ -391,6 +445,156 @@ private fun wordSyncedFillFraction(
     }
     val filledChars = activeRange.start + (activeRange.endExclusive - activeRange.start) * cueProgress
     return rowFillFraction(row, filledChars / line.text.length.coerceAtLeast(1), line.text.length)
+}
+
+@Composable
+private fun KaraokeCharacterLineText(
+    text: String,
+    cells: List<LyricCell>,
+    currentTimeMs: Int,
+    colors: PlayerContentColors,
+    textStyle: TextStyle,
+    maxLines: Int,
+    textAlign: TextAlign = TextAlign.Center,
+) {
+    val lineText = text.takeIf { it.isNotBlank() } ?: LYRIC_LINE_PLACEHOLDER
+    val style = textStyle.copy(fontWeight = FontWeight.Bold)
+    val renderCells = cells.takeIf { it.isNotEmpty() }
+        ?: listOf(LyricCell(currentTimeMs, currentTimeMs, lineText, timed = false))
+    val glyphs = remember(renderCells, currentTimeMs) {
+        buildKaraokeGlyphs(renderCells, currentTimeMs)
+    }
+    val fullText = remember(renderCells) {
+        renderCells.joinToString(separator = "") { it.text.ifEmpty { " " } }.ifEmpty { " " }
+    }
+    val textMeasurer = rememberTextMeasurer()
+    val flowingLight2 = remember(colors.primary, colors.tertiary) {
+        lerpColor(colors.primary, colors.tertiary, 0.34f)
+    }
+    val flowingLight1 = remember(colors.primary, flowingLight2) {
+        lerpColor(colors.primary, flowingLight2, 0.5f)
+    }
+    val flowingLight3 = remember(colors.primary, colors.tertiary) {
+        lerpColor(colors.primary, colors.tertiary, 0.58f)
+    }
+
+    Layout(
+        content = {
+            glyphs.forEach { glyph ->
+                Text(
+                    text = buildGlyphText(
+                        char = glyph.char,
+                        progress = glyph.colorProgress,
+                        sungColor = colors.primary,
+                        flowingLight1 = flowingLight1,
+                        flowingLight2 = flowingLight2,
+                        flowingLight3 = flowingLight3,
+                        unsungColor = colors.tertiary,
+                        gradientPercentage = 0.25f,
+                    ),
+                    style = style,
+                    softWrap = false,
+                    maxLines = 1,
+                )
+            }
+        },
+        modifier = Modifier.fillMaxWidth(),
+    ) { measurables, constraints ->
+        val looseConstraints = constraints.copy(minWidth = 0, minHeight = 0)
+        val placeables = measurables.map { it.measure(looseConstraints) }
+        val textConstraints = if (constraints.hasBoundedWidth) {
+            constraints.copy(minWidth = constraints.maxWidth, minHeight = 0)
+        } else {
+            constraints.copy(minWidth = 0, minHeight = 0)
+        }
+        val textLayout = textMeasurer.measure(
+            text = buildAnnotatedString { append(fullText) },
+            style = style.copy(textAlign = textAlign),
+            constraints = textConstraints,
+        )
+        val layoutWidth = textLayout.size.width.coerceIn(constraints.minWidth, constraints.maxWidth)
+        val layoutHeight = textLayout.size.height.coerceIn(constraints.minHeight, constraints.maxHeight)
+
+        layout(width = layoutWidth, height = layoutHeight) {
+            glyphs.indices.forEach { index ->
+                val placeable = placeables[index]
+                val lineIndex = textLayout.getLineForOffset(index)
+                val rect = textLayout.getBoundingBox(index)
+                val baseline = placeable[FirstBaseline].let { value ->
+                    if (value == AlignmentLine.Unspecified) placeable.height else value
+                }
+                val lineBaseline = textLayout.getLineBaseline(lineIndex)
+                placeable.placeRelative(
+                    x = rect.left.roundToInt().coerceAtLeast(0),
+                    y = (lineBaseline - baseline).roundToInt().coerceAtLeast(0),
+                )
+            }
+        }
+    }
+}
+
+private data class KaraokeGlyph(
+    val char: Char,
+    val colorProgress: Float,
+)
+
+private fun buildKaraokeGlyphs(
+    cells: List<LyricCell>,
+    currentTimeMs: Int,
+): List<KaraokeGlyph> =
+    cells.flatMap { cell ->
+        val text = cell.text.ifEmpty { " " }
+        val cellProgress = cell.progressAt(currentTimeMs)
+        text.mapIndexed { charIndex, char ->
+            val progress = when {
+                currentTimeMs >= cell.endTimeMs -> 1f
+                currentTimeMs in cell.startTimeMs..<cell.endTimeMs -> {
+                    (cellProgress * text.length - charIndex).coerceIn(0f, 1f)
+                }
+                else -> 0f
+            }
+            KaraokeGlyph(char = char, colorProgress = progress)
+        }
+    }
+
+private fun LyricCell.progressAt(currentTimeMs: Int): Float {
+    if (!timed || endTimeMs <= startTimeMs) return 1f
+    return ((currentTimeMs - startTimeMs).toFloat() / (endTimeMs - startTimeMs)).coerceIn(0f, 1f)
+}
+
+private fun buildGlyphText(
+    char: Char,
+    progress: Float,
+    sungColor: Color,
+    flowingLight1: Color,
+    flowingLight2: Color,
+    flowingLight3: Color,
+    unsungColor: Color,
+    gradientPercentage: Float,
+) = buildAnnotatedString {
+    val p = progress.coerceIn(0f, 1f)
+    val style = when {
+        p <= 0f -> SpanStyle(color = unsungColor)
+        p >= 1f -> SpanStyle(color = sungColor)
+        else -> {
+            val band = gradientPercentage.coerceIn(0.05f, 0.5f)
+            val leadStart = (p - band * 0.5f).coerceIn(0f, 1f)
+            val leadEnd = (p + band * 0.5f).coerceIn(0f, 1f)
+            SpanStyle(
+                brush = Brush.horizontalGradient(
+                    0f to sungColor,
+                    leadStart to sungColor,
+                    p to flowingLight2,
+                    leadEnd to flowingLight3,
+                    leadEnd to unsungColor,
+                    1f to unsungColor,
+                ),
+            )
+        }
+    }
+    withStyle(style) {
+        append(char.toString())
+    }
 }
 
 @Composable
