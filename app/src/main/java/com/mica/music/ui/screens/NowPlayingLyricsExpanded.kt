@@ -32,6 +32,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.sp
 import com.mica.music.data.LyricDisplayRows
 import com.mica.music.data.LyricLine
+import com.mica.music.data.LyricLineSide
 import com.mica.music.data.DEFAULT_LYRICS_PAGE_FONT_SIZE_SP
 import com.mica.music.data.LyricsBilingualDisplayMode
 import com.mica.music.data.LyricsPageAlignment
@@ -158,6 +159,16 @@ internal fun ExpandedLyricsPanel(
                 key = { index, line -> "$index-${line.timeMs}-${line.text}" },
             ) { index, line ->
                 val isCurrent = timed && index in highlightLineIndices
+                val lineTextAlign = when (line.side) {
+                    LyricLineSide.Start -> TextAlign.Start
+                    LyricLineSide.End -> TextAlign.End
+                    LyricLineSide.Center -> textAlign
+                }
+                val lineHorizontalAlignment = when (line.side) {
+                    LyricLineSide.Start -> Alignment.Start
+                    LyricLineSide.End -> Alignment.End
+                    LyricLineSide.Center -> horizontalAlignment
+                }
                 LyricLineBlock(
                     text = line.text,
                     isCurrent = isCurrent,
@@ -169,8 +180,8 @@ internal fun ExpandedLyricsPanel(
                     nextLineTimeMs = lyrics.getOrNull(index + 1)?.timeMs,
                     positionMs = positionMs,
                     isPlaying = isPlaying,
-                    textAlign = textAlign,
-                    horizontalAlignment = horizontalAlignment,
+                    textAlign = lineTextAlign,
+                    horizontalAlignment = lineHorizontalAlignment,
                     bilingualDisplayMode = bilingualDisplayMode,
                     translationTextStyle = translationTextStyle,
                     modifier = Modifier

@@ -3,8 +3,9 @@ package com.mica.music.data.local
 import androidx.room.Entity
 import androidx.room.PrimaryKey
 import com.mica.music.data.LyricCell
-import com.mica.music.data.LyricLine
 import com.mica.music.data.LyricCue
+import com.mica.music.data.LyricLine
+import com.mica.music.data.LyricLineSide
 import com.mica.music.data.Song
 import com.mica.music.data.TrackMetadata
 import org.json.JSONArray
@@ -167,6 +168,9 @@ private fun encodeLyrics(lines: List<LyricLine>): String {
         }
         line.subText?.takeIf { it.isNotBlank() }?.let { encoded.put("sub", it) }
         line.romanizationText?.takeIf { it.isNotBlank() }?.let { encoded.put("rom", it) }
+        if (line.side != LyricLineSide.Center) {
+            encoded.put("side", line.side.name)
+        }
         if (line.cues.isNotEmpty()) {
             val cues = JSONArray()
             line.cues.forEach { cue ->
@@ -220,6 +224,10 @@ private fun decodeLyrics(json: String): List<LyricLine> {
                         cells = cells,
                         subText = obj.optString("sub").takeIf { it.isNotBlank() },
                         romanizationText = obj.optString("rom").takeIf { it.isNotBlank() },
+                        side = obj.optString("side")
+                            .takeIf { it.isNotBlank() }
+                            ?.let { runCatching { LyricLineSide.valueOf(it) }.getOrNull() }
+                            ?: LyricLineSide.Center,
                     ),
                 )
             }

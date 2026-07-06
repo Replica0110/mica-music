@@ -61,6 +61,7 @@ data class LyricLine(
     val cells: List<LyricCell> = emptyList(),
     val subText: String? = null,
     val romanizationText: String? = null,
+    val side: LyricLineSide = LyricLineSide.Center,
 ) {
     val mainText: String
         get() = cells.joinToString(separator = "") { it.text }
@@ -72,6 +73,12 @@ data class LyricLine(
 
     fun resolvedEndTimeMs(fallback: Int): Int =
         endTimeMs?.takeIf { it >= timeMs } ?: fallback
+}
+
+enum class LyricLineSide {
+    Start,
+    Center,
+    End,
 }
 
 /** A timed visible fragment within a lyric line. The text retains source spacing and punctuation. */

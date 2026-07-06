@@ -2,6 +2,7 @@ package com.mica.music.data.scanner
 
 import com.mica.music.data.LyricLine
 import com.mica.music.data.LyricCue
+import com.mica.music.data.LyricLineSide
 import com.mica.music.data.LyricsSync
 import java.io.File
 import java.nio.charset.StandardCharsets
@@ -186,6 +187,27 @@ class LyricsParsingTest {
     }
 
     @Test
+    fun ttmlAssignsDuetAgentLinesToLeftAndRight() {
+        val parsed = LrcParser.parse(
+            """
+            <tt xmlns="http://www.w3.org/ns/ttml" xmlns:ttm="http://www.w3.org/ns/ttml#metadata">
+              <body><div>
+                <p begin="1s" end="3s" ttm:agent="v1"><span begin="1s" end="2.9s">有我在</span></p>
+                <p begin="1.5s" end="3.5s" ttm:agent="v2"><span begin="1.5s" end="3.4s">有你在</span></p>
+                <p begin="4s" end="5s" ttm:agent="v3"><span begin="4s" end="4.9s">一起唱</span></p>
+              </div></body>
+            </tt>
+            """.trimIndent(),
+        )
+
+        assertEquals(listOf("有我在", "有你在", "一起唱"), parsed.map { it.mainText })
+        assertEquals(
+            listOf(LyricLineSide.Start, LyricLineSide.End, LyricLineSide.Start),
+            parsed.map { it.side },
+        )
+    }
+
+    @Test
     fun realCoralSeaTtmlFixtureKeepsItsWordTimelineWhenAvailable() {
         val fixture = listOf(File(".test-music"), File("../.test-music"))
             .flatMap { it.listFiles().orEmpty().asList() }
@@ -235,6 +257,37 @@ class LyricsParsingTest {
         assertEquals(0, LyricsSync.indexForPosition(lyrics, 800))
         assertEquals(1, LyricsSync.indexForPosition(lyrics, 1_900))
         assertEquals(-1, LyricsSync.indexForPosition(emptyList(), 1_000))
+    }
+
+    @Test
+    fun lyricSyncDoesNotReviveOlderOverlapBeforeNextLineStarts() {
+        val lyrics = listOf(
+            LyricLine(timeMs = 134_968, text = "I'm here", endTimeMs = 137_188),
+            LyricLine(timeMs = 136_742, text = "关上灯比较不孤单", endTimeMs = 140_419),
+            LyricLine(timeMs = 137_839, text = "不让你孤单", endTimeMs = 140_386),
+            LyricLine(timeMs = 140_505, text = "你给的力量", endTimeMs = 147_139),
+        )
+
+        assertEquals(setOf(1), LyricsSync.activeLineIndicesAt(lyrics, 140_400 - LyricsSync.LEAD_MS))
+        assertEquals(setOf(1, 2), LyricsSync.highlightLineIndicesAt(lyrics, 140_400 - LyricsSync.LEAD_MS))
+        assertEquals(emptySet<Int>(), LyricsSync.activeLineIndicesAt(lyrics, 140_450 - LyricsSync.LEAD_MS))
+        assertEquals(setOf(1, 2), LyricsSync.highlightLineIndicesAt(lyrics, 140_450 - LyricsSync.LEAD_MS))
+        assertEquals(setOf(3), LyricsSync.highlightLineIndicesAt(lyrics, 140_600 - LyricsSync.LEAD_MS))
+    }
+
+    @Test
+    fun lyricSyncKeepsNearSimultaneousEndedLinesUntilNextLineStarts() {
+        val lyrics = listOf(
+            LyricLine(timeMs = 212_213, text = "有你在", endTimeMs = 214_507),
+            LyricLine(timeMs = 212_211, text = "有我在", endTimeMs = 214_460),
+            LyricLine(timeMs = 214_937, text = "什么都无畏", endTimeMs = 222_169),
+        )
+
+        assertEquals(setOf(0), LyricsSync.activeLineIndicesAt(lyrics, 214_480 - LyricsSync.LEAD_MS))
+        assertEquals(setOf(0, 1), LyricsSync.highlightLineIndicesAt(lyrics, 214_480 - LyricsSync.LEAD_MS))
+        assertEquals(emptySet<Int>(), LyricsSync.activeLineIndicesAt(lyrics, 214_600 - LyricsSync.LEAD_MS))
+        assertEquals(setOf(0, 1), LyricsSync.highlightLineIndicesAt(lyrics, 214_600 - LyricsSync.LEAD_MS))
+        assertEquals(setOf(2), LyricsSync.highlightLineIndicesAt(lyrics, 214_950 - LyricsSync.LEAD_MS))
     }
 
     @Test

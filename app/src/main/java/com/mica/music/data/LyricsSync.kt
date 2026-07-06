@@ -19,10 +19,18 @@ object LyricsSync {
         return idx
     }
 
+    fun activeLineIndicesAt(lyrics: List<LyricLine>, positionMs: Int): Set<Int> {
+        if (lyrics.isEmpty() || !hasTimedLyrics(lyrics)) return emptySet()
+        val t = positionMs + LEAD_MS
+        return lyrics.indices.filterTo(mutableSetOf()) { index ->
+            lyrics[index].timeMs <= t && t < lyrics.endTimeAt(index)
+        }
+    }
+
     fun highlightLineIndicesAt(lyrics: List<LyricLine>, positionMs: Int): Set<Int> {
         if (lyrics.isEmpty() || !hasTimedLyrics(lyrics)) return emptySet()
         val t = positionMs + LEAD_MS
-        val anchorIndex = primaryLineIndexAt(lyrics, positionMs)
+        val anchorIndex = lyrics.latestStartedLineIndexAt(t)
         if (anchorIndex < 0) return emptySet()
         val anchorLine = lyrics[anchorIndex]
         if (t < anchorLine.timeMs) return emptySet()
@@ -82,6 +90,19 @@ object LyricsSync {
 
     private fun List<LyricLine>.overlaps(leftIndex: Int, rightIndex: Int): Boolean =
         this[leftIndex].timeMs < endTimeAt(rightIndex) && this[rightIndex].timeMs < endTimeAt(leftIndex)
+
+    private fun List<LyricLine>.latestStartedLineIndexAt(positionMs: Int): Int {
+        var latestIndex = -1
+        for (index in indices) {
+            val line = this[index]
+            if (line.timeMs <= positionMs &&
+                (latestIndex == -1 || line.timeMs >= this[latestIndex].timeMs)
+            ) {
+                latestIndex = index
+            }
+        }
+        return latestIndex
+    }
 
     private fun List<LyricLine>.endTimeAt(index: Int): Int {
         val line = this[index]

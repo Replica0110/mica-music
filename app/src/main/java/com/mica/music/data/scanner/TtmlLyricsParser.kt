@@ -3,6 +3,7 @@ package com.mica.music.data.scanner
 import com.mica.music.data.LyricCell
 import com.mica.music.data.LyricCue
 import com.mica.music.data.LyricLine
+import com.mica.music.data.LyricLineSide
 import com.mica.music.util.DiagnosticLog
 import java.io.StringReader
 import javax.xml.XMLConstants
@@ -80,6 +81,7 @@ internal object TtmlLyricsParser {
                 val key = paragraph.attr("key", NS_ITUNES_INTERNAL)
                     ?: paragraph.attr("key", NS_ITUNES_LEGACY)
                     ?: paragraph.attr("key")
+                val agentId = paragraph.attr("agent", NS_TTM) ?: paragraph.attr("agent")
                 val role = paragraph.attr("role", NS_TTM)
                 val lineEnd = end
                     ?: parsed.cells.lastOrNull { it.timed }?.endTimeMs
@@ -95,7 +97,7 @@ internal object TtmlLyricsParser {
                     "x-bg" -> Unit
                     else -> {
                         lineFromCells(fallbackStart, lineEnd, parsed.cells)?.let { line ->
-                            originals += KeyedLine(line, key)
+                            originals += KeyedLine(line, key, agentId)
                         }
                         textOnlyLine(parsed.translationText, fallbackStart, lineEnd, key)?.let {
                             translations += KeyedLine(it, key)
@@ -116,7 +118,7 @@ internal object TtmlLyricsParser {
                 .toMap()
             val romanizationByStart = romanizations.associate { it.line.timeMs to it.line.mainText }
 
-            originals
+            originals.withDuetSides()
                 .map { keyed ->
                     val line = keyed.line
                     val translation = keyed.key?.let { translationByKey[it] } ?: translationByStart[line.timeMs]
@@ -133,7 +135,11 @@ internal object TtmlLyricsParser {
         }.getOrDefault(emptyList())
     }
 
-    private data class KeyedLine(val line: LyricLine, val key: String?)
+    private data class KeyedLine(
+        val line: LyricLine,
+        val key: String?,
+        val agentId: String? = null,
+    )
 
     private data class ParsedParagraph(
         val visibleText: String,
@@ -141,6 +147,49 @@ internal object TtmlLyricsParser {
         val romanizationText: String,
         val cells: List<LyricCell>,
     )
+
+    private fun List<KeyedLine>.withDuetSides(): List<KeyedLine> {
+        val sideByAgent = resolveDuetSideByAgent()
+        if (sideByAgent.isEmpty()) return this
+
+        return map { keyed ->
+            val side = keyed.agentId?.let { sideByAgent[it] } ?: LyricLineSide.Center
+            keyed.copy(line = keyed.line.copy(side = side))
+        }
+    }
+
+    private fun List<KeyedLine>.resolveDuetSideByAgent(): Map<String, LyricLineSide> {
+        if (size < 2) return emptyMap()
+
+        val overlappingAgentIds = linkedSetOf<String>()
+        for (firstIndex in 0 until lastIndex) {
+            val first = this[firstIndex]
+            val firstAgentId = first.agentId?.takeIf { it.isNotBlank() } ?: continue
+            for (secondIndex in firstIndex + 1 until size) {
+                val second = this[secondIndex]
+                val secondAgentId = second.agentId?.takeIf { it.isNotBlank() } ?: continue
+                if (firstAgentId == secondAgentId || !first.line.overlaps(second.line)) continue
+
+                overlappingAgentIds += firstAgentId
+                overlappingAgentIds += secondAgentId
+            }
+        }
+        if (overlappingAgentIds.size < 2) return emptyMap()
+
+        val orderedAgentIds = linkedSetOf<String>()
+        asSequence()
+            .mapNotNull { it.agentId?.takeIf { agentId -> agentId.isNotBlank() } }
+            .forEach { orderedAgentIds += it }
+
+        return orderedAgentIds.mapIndexed { index, agentId ->
+            agentId to if (index % 2 == 0) LyricLineSide.Start else LyricLineSide.End
+        }.toMap()
+    }
+
+    private fun LyricLine.overlaps(other: LyricLine): Boolean {
+        return timeMs < (other.endTimeMs ?: other.timeMs) &&
+            other.timeMs < (endTimeMs ?: timeMs)
+    }
 
     private fun parseParagraphText(paragraph: Element, fallbackStart: Int, fallbackEnd: Int): ParsedParagraph {
         val cells = mutableListOf<LyricCell>()
