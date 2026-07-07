@@ -45,10 +45,12 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.mica.music.data.AlbumBrowseSortField
+import com.mica.music.data.ArtistBrowseSortField
 import com.mica.music.data.ArtistNames
 import com.mica.music.data.BrowseGroup
 import com.mica.music.data.FolderBrowseGroup
 import com.mica.music.data.LibraryBrowse
+import com.mica.music.data.LibraryBrowseDetails
 import com.mica.music.data.MusicLibrary
 import com.mica.music.data.Song
 import com.mica.music.data.SongDetails
@@ -61,27 +63,9 @@ import com.mica.music.ui.components.SongRow
 import com.mica.music.ui.motion.MicaMotion
 import com.mica.music.ui.theme.HifiSpacing
 import com.mica.music.ui.theme.MicaTheme
-
-sealed class BrowseDestination {
-    data object Root : BrowseDestination()
-    data class Artist(val name: String) : BrowseDestination()
-    data class Album(val title: String) : BrowseDestination()
-    data class Folder(
-        val depth: Int,
-        val scopePathSegments: List<String> = emptyList(),
-    ) : BrowseDestination()
-}
-
-data class HomeNavigationIntent(
-    val section: HomeSection,
-    val browseDestination: BrowseDestination,
-)
-
-private fun browseDestinationDepth(destination: BrowseDestination): Int = when (destination) {
-    BrowseDestination.Root -> 0
-    is BrowseDestination.Folder -> 1 + destination.depth
-    else -> 1
-}
+import com.mica.music.ui.screens.home.BrowseDestination
+import com.mica.music.ui.screens.home.HomeSection
+import com.mica.music.ui.screens.home.browseDestinationDepth
 
 @Composable
 internal fun HomeBrowseContent(
@@ -100,6 +84,7 @@ internal fun HomeBrowseContent(
     albumSortField: AlbumBrowseSortField = AlbumBrowseSortField.TITLE,
     albumSortDirection: SortDirection = SortDirection.ASC,
     albumGridColumns: Int = 1,
+    artistSortField: ArtistBrowseSortField = ArtistBrowseSortField.TITLE,
     artistSortDirection: SortDirection = SortDirection.ASC,
     artistGridColumns: Int = 1,
     listBottomPadding: Dp = 0.dp,
@@ -135,6 +120,7 @@ internal fun HomeBrowseContent(
                             library = library,
                             listState = artistListState,
                             onSelect = { onDestinationChange(BrowseDestination.Artist(it)) },
+                            sortField = artistSortField,
                             sortDirection = artistSortDirection,
                             gridColumns = artistGridColumns,
                             listBottomPadding = listBottomPadding,
@@ -320,19 +306,6 @@ private fun List<String>.scopeForFolderDepth(depth: Int): List<String> = when {
     else -> this
 }
 
-private data class ArtistAlbumSection(
-    val title: String,
-    val year: Int,
-    val albumArtUri: String?,
-    val coverColorArgb: Int,
-    val songs: List<Song>,
-)
-
-private data class AlbumDiscSection(
-    val discNumber: Int?,
-    val songs: List<Song>,
-)
-
 @Composable
 private fun AlbumDetailPanel(
     albumTitle: String,
@@ -353,9 +326,8 @@ private fun AlbumDetailPanel(
         return
     }
 
-    val orderedSongs = remember(songs) { sortedAlbumSongs(songs) }
-    val discSections = remember(orderedSongs) { albumDiscSections(orderedSongs) }
-    val copyright = remember(orderedSongs) { albumCopyrightLine(orderedSongs) }
+    val detail = remember(songs) { LibraryBrowseDetails.albumDetail(songs) }
+    val orderedSongs = detail.orderedSongs
     LazyColumn(
         state = listState,
         modifier = modifier.fillMaxSize(),
@@ -377,7 +349,7 @@ private fun AlbumDetailPanel(
                 onAddToQueue = { onAppendSongsToQueue(orderedSongs) },
             )
         }
-        discSections.forEach { section ->
+        detail.discSections.forEach { section ->
             section.discNumber?.let { discNumber ->
                 item("albumDisc:$discNumber") {
                     Text(
@@ -412,7 +384,7 @@ private fun AlbumDetailPanel(
                 )
             }
         }
-        copyright?.let { label ->
+        detail.copyright?.let { label ->
             item("albumCopyright") {
                 Text(
                     text = label,
@@ -510,9 +482,6 @@ private fun albumStatsLine(songs: List<Song>): String =
         totalDurationLabel(songs.sumOf { it.durationSec.coerceAtLeast(0) }),
     ).joinToString(" · ")
 
-private fun albumCopyrightLine(songs: List<Song>): String? =
-    songs.firstNotNullOfOrNull { song -> song.copyright.trim().takeIf { it.isNotEmpty() } }
-
 private fun totalDurationLabel(totalSeconds: Int): String {
     val hours = totalSeconds / 3600
     val minutes = (totalSeconds % 3600) / 60
@@ -522,22 +491,6 @@ private fun totalDurationLabel(totalSeconds: Int): String {
     } else {
         "%d:%02d".format(minutes, seconds)
     }
-}
-
-private fun sortedAlbumSongs(songs: List<Song>): List<Song> =
-    songs.sortedWith(
-        compareBy<Song> { if (it.discNumber > 0) it.discNumber else Int.MAX_VALUE }
-            .thenBy { if (it.trackNumber > 0) it.trackNumber else Int.MAX_VALUE }
-            .thenBy { it.title.lowercase() },
-    )
-
-private fun albumDiscSections(songs: List<Song>): List<AlbumDiscSection> {
-    if (songs.none { it.discNumber > 0 }) {
-        return listOf(AlbumDiscSection(discNumber = null, songs = songs))
-    }
-    return songs.groupBy { it.discNumber.takeIf { disc -> disc > 0 } }
-        .map { (discNumber, discSongs) -> AlbumDiscSection(discNumber, discSongs) }
-        .sortedBy { it.discNumber ?: Int.MAX_VALUE }
 }
 
 @Composable
@@ -561,7 +514,7 @@ private fun ArtistDetailPanel(
         return
     }
 
-    val albumSections = remember(songs) { artistAlbumSections(songs) }
+    val albumSections = remember(songs) { LibraryBrowseDetails.artistAlbumSections(songs) }
     LazyColumn(
         state = listState,
         modifier = modifier.fillMaxSize(),
@@ -617,7 +570,7 @@ private fun ArtistDetailPanel(
 private fun ArtistDetailHeader(
     artistName: String,
     songs: List<Song>,
-    albumSections: List<ArtistAlbumSection>,
+    albumSections: List<LibraryBrowseDetails.ArtistAlbumSection>,
     onPlayAll: () -> Unit,
     onShuffle: () -> Unit,
     onAddToQueue: () -> Unit,
@@ -722,7 +675,7 @@ private fun ArtistActionDivider() {
 
 @Composable
 private fun ArtistAlbumHeader(
-    section: ArtistAlbumSection,
+    section: LibraryBrowseDetails.ArtistAlbumSection,
     onAlbumClick: (String) -> Unit,
 ) {
     Row(
@@ -768,29 +721,9 @@ private fun ArtistAlbumHeader(
     }
 }
 
-private fun artistAlbumSections(songs: List<Song>): List<ArtistAlbumSection> {
-    val buckets = linkedMapOf<String, MutableList<Song>>()
-    songs.forEach { song ->
-        buckets.getOrPut(song.album.ifBlank { "未知专辑" }) { mutableListOf() }.add(song)
-    }
-    return buckets.map { (album, albumSongs) ->
-        val artworkSong = albumSongs.firstOrNull { !it.albumArtUri.isNullOrBlank() } ?: albumSongs.first()
-        ArtistAlbumSection(
-            title = album,
-            year = albumSongs.map { it.year }.filter { it > 0 }.maxOrNull() ?: 0,
-            albumArtUri = artworkSong.albumArtUri,
-            coverColorArgb = artworkSong.coverColorArgb,
-            songs = albumSongs.sortedWith(
-                compareBy<Song> { if (it.trackNumber > 0) it.trackNumber else Int.MAX_VALUE }
-                    .thenBy { it.title.lowercase() },
-            ),
-        )
-    }.sortedWith(compareByDescending<ArtistAlbumSection> { it.year > 0 }.thenByDescending { it.year })
-}
-
 private fun artistStatsLine(
     songs: List<Song>,
-    albumSections: List<ArtistAlbumSection>,
+    albumSections: List<LibraryBrowseDetails.ArtistAlbumSection>,
 ): String {
     val formats = songs.map { it.formatLabel }
         .filter { it.isNotBlank() }
@@ -879,13 +812,14 @@ private fun ArtistGroupList(
     library: MusicLibrary,
     listState: LazyListState,
     onSelect: (String) -> Unit,
+    sortField: ArtistBrowseSortField,
     sortDirection: SortDirection,
     gridColumns: Int,
     listBottomPadding: Dp = 0.dp,
     modifier: Modifier = Modifier,
 ) {
-    val groups = remember(library.songs, sortDirection) {
-        LibraryBrowse.sortArtistGroups(library.artistGroups(), sortDirection)
+    val groups = remember(library.songs, sortField, sortDirection) {
+        LibraryBrowse.sortArtistGroups(library.artistGroups(), sortField, sortDirection)
     }
     if (groups.isEmpty()) {
         EmptyBrowseHint("暂无艺术家", modifier)
@@ -897,7 +831,10 @@ private fun ArtistGroupList(
         gridColumns = gridColumns,
         onSelect = onSelect,
         gridTitleMaxLines = 1,
-        fastScrollLabels = groups.map { it.title },
+        fastScrollLabels = when (sortField) {
+            ArtistBrowseSortField.TITLE -> groups.map { it.title }
+            ArtistBrowseSortField.SONG_COUNT -> null
+        },
         fastScrollDescending = sortDirection == SortDirection.DESC,
         listBottomPadding = listBottomPadding,
         modifier = modifier,

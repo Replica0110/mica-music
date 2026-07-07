@@ -42,10 +42,12 @@ import com.mica.music.imaging.MicaImageLoaders
 import com.mica.music.ui.components.AddToPlaylistSheet
 import com.mica.music.ui.components.MicaConfirmDialog
 import com.mica.music.ui.components.PlaybackQueueSheet
+import com.mica.music.ui.components.PlaybackTuningSheet
 import com.mica.music.ui.components.SleepTimerSheet
 import com.mica.music.ui.components.SongActionMenuSheet
 import com.mica.music.ui.components.SongMenuAction
 import com.mica.music.ui.components.cachedCoverAspectRatio
+import com.mica.music.ui.components.formatPlaybackTuningMenuLabel
 import com.mica.music.ui.components.rememberPlaybackSeekState
 import com.mica.music.ui.motion.rememberMicaMotionEnabled
 import com.mica.music.ui.screens.player.ParticleCoverPlayerLayer
@@ -57,7 +59,7 @@ import com.mica.music.ui.theme.rememberPlaybackContentColors
 import com.mica.music.ui.theme.rememberPlayerScreenAppearance
 import com.mica.music.ui.theme.relativeLuminance
 import com.mica.music.util.TrackSwitchPerformance
-import com.mica.music.util.deleteSongFile
+import com.mica.music.util.deleteSongEverywhere
 import com.mica.music.util.logBackFlow
 import com.mica.music.util.openSongInTagEditor
 import com.mica.music.util.shareSong
@@ -81,6 +83,9 @@ data class NowPlayingActions(
     val toggleLyricsPageImmersive: () -> Unit,
     val insertPlayNext: (Song) -> Unit,
     val setQueue: (List<Song>) -> Unit,
+    val setPlaybackSpeed: (Float) -> Unit,
+    val setPlaybackPitchSemitones: (Float) -> Unit,
+    val resetPlaybackTuning: () -> Unit,
 )
 
 internal suspend fun pollNowPlayingProgress(
@@ -179,6 +184,7 @@ fun NowPlayingContent(
     var pendingDeleteSong by remember { mutableStateOf<Song?>(null) }
     var queueSheetOpen by remember { mutableStateOf(false) }
     var sleepTimerSheetOpen by remember { mutableStateOf(false) }
+    var playbackTuningSheetOpen by remember { mutableStateOf(false) }
     var lyricsExpanded by remember { mutableStateOf(false) }
 
     LaunchedEffect(
@@ -187,6 +193,7 @@ fun NowPlayingContent(
         lyricsExpanded,
         queueSheetOpen,
         sleepTimerSheetOpen,
+        playbackTuningSheetOpen,
         actionMenuSong,
         addToPlaylistSong,
         pendingDeleteSong,
@@ -194,7 +201,8 @@ fun NowPlayingContent(
         logBackFlow(
             "page now-playing song=${song.id} handleBackToClose=$handleBackToClose " +
                 "lyricsExpanded=$lyricsExpanded queueSheet=$queueSheetOpen " +
-                "sleepTimerSheet=$sleepTimerSheetOpen actionMenu=${actionMenuSong?.id ?: "none"} " +
+                "sleepTimerSheet=$sleepTimerSheetOpen playbackTuningSheet=$playbackTuningSheetOpen " +
+                "actionMenu=${actionMenuSong?.id ?: "none"} " +
                 "addToPlaylist=${addToPlaylistSong?.id ?: "none"} delete=${pendingDeleteSong?.id ?: "none"}",
         )
     }
@@ -261,13 +269,15 @@ fun NowPlayingContent(
 
     fun performDeleteSong(target: Song) {
         scope.launch {
-            val deleted = deleteSongFile(context, target)
-            library.removeSongFromLibrary(target.id)
-            playlistStore.removeSongFromAllPlaylists(target.id)
-            val remaining = queueState.queue.filterNot { it.id == target.id }
-            actions.setQueue(remaining)
-            val message = if (deleted) "已从设备删除" else "已从曲库移除（无法删除文件）"
-            snackbarHostState.showSnackbar(message)
+            val result = deleteSongEverywhere(
+                context = context,
+                song = target,
+                currentQueue = queueState.queue,
+                removeFromLibrary = library::removeSongFromLibrary,
+                removeFromAllPlaylists = playlistStore::removeSongFromAllPlaylists,
+                setQueue = { actions.setQueue(it) },
+            )
+            snackbarHostState.showSnackbar(result.message)
         }
     }
 
@@ -558,6 +568,12 @@ fun NowPlayingContent(
                     actionMenuSong = null
                     sleepTimerSheetOpen = true
                 },
+                showPlaybackTuning = true,
+                playbackTuningLabel = formatPlaybackTuningMenuLabel(surfaceState.playbackTuning),
+                onPlaybackTuningClick = {
+                    actionMenuSong = null
+                    playbackTuningSheetOpen = true
+                },
             )
         }
 
@@ -580,6 +596,16 @@ fun NowPlayingContent(
                         snackbarHostState.showSnackbar("已关闭睡眠定时")
                     }
                 },
+            )
+        }
+
+        if (playbackTuningSheetOpen) {
+            PlaybackTuningSheet(
+                tuning = surfaceState.playbackTuning,
+                onDismiss = { playbackTuningSheetOpen = false },
+                onSpeedChange = actions.setPlaybackSpeed,
+                onPitchSemitonesChange = actions.setPlaybackPitchSemitones,
+                onReset = actions.resetPlaybackTuning,
             )
         }
 

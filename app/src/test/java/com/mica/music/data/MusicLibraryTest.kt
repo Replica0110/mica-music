@@ -4,6 +4,8 @@ import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
 import com.mica.music.data.local.CachedLibrary
 import com.mica.music.data.local.LibrarySyncResult
+import com.mica.music.data.preferences.LibraryBrowseSettings
+import com.mica.music.data.preferences.PreferencesTestFixtures
 import com.mica.music.data.scanner.ScanResult
 import com.mica.music.testutil.SongFixtures
 import kotlinx.coroutines.CompletableDeferred
@@ -56,27 +58,6 @@ class MusicLibraryTest {
     }
 
     @Test
-    fun lyricsParserUpgradeForcesOneSuccessfulLyricsRefresh() = runTest {
-        val cached = SongFixtures.song("cached")
-        val scanner = ControlledScanner()
-        val environment = FakeScanEnvironment(parserVersion = 0)
-        val library = library(
-            scanner = scanner,
-            store = FakeLibraryStore(CachedLibrary(listOf(cached), 100, ScanSource.DEVICE, 1)),
-            environment = environment,
-        )
-
-        val scan = async { library.scanDeviceWide() }
-        runCurrent()
-        assertTrue(scanner.deviceRequests.single().cachedSongs.single().lyrics.isEmpty())
-        scanner.deviceRequests.single().result.complete(ScanResult(listOf(cached), 1))
-        scan.await()
-
-        assertEquals(CURRENT_LYRICS_PARSER_VERSION, environment.parserVersion)
-        library.release()
-    }
-
-    @Test
     fun artworkCacheRepairStartsForcedArtworkOnlyScanWhenCachedArtNeedsRepair() = runTest {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
         val missingArt = File(context.cacheDir, "album_art/missing-startup.jpg")
@@ -102,52 +83,6 @@ class MusicLibraryTest {
         assertFalse(library.isScanning)
         assertEquals("content://media/external/audio/albums/1", library.songs.single().albumArtUri)
         library.release()
-    }
-
-    @Test
-    fun latestScanWinsWhenOlderResultArrivesLast() = runTest {
-        val scanner = ControlledScanner()
-        val library = library(scanner, FakeLibraryStore())
-
-        val oldScan = async { library.scanDeviceWide() }
-        runCurrent()
-        val newScan = async { library.scanDeviceWide() }
-        runCurrent()
-
-        scanner.deviceRequests[1].result.complete(
-            ScanResult(listOf(SongFixtures.song("new")), 20),
-        )
-        newScan.await()
-        scanner.deviceRequests[0].result.complete(
-            ScanResult(listOf(SongFixtures.song("old")), 10),
-        )
-        oldScan.await()
-
-        assertEquals(listOf("new"), library.songs.map { it.id })
-        assertEquals(20, library.totalSizeMb)
-        library.release()
-    }
-
-    @Test
-    fun releasePreventsLateScanStatePublication() = runTest {
-        val scanner = ControlledScanner()
-        val store = FakeLibraryStore()
-        val library = library(scanner, store)
-
-        val scan = async { library.scanDeviceWide() }
-        runCurrent()
-        library.release()
-        scanner.deviceRequests.single().result.complete(
-            ScanResult(listOf(SongFixtures.song("late")), 99),
-        )
-        scan.await()
-
-        assertTrue(library.songs.isEmpty())
-        assertFalse(library.hasScanned)
-        assertFalse(library.isScanning)
-        assertNull(library.scanProgressLabel)
-        assertNull(library.lastScanAtMs)
-        assertTrue(store.syncedSongs.isEmpty())
     }
 
     @Test
@@ -202,6 +137,46 @@ class MusicLibraryTest {
         assertEquals(listOf("new"), library.songs.map { it.id })
         assertEquals(listOf("new"), store.persistedSongs.map { it.id })
         assertEquals(listOf("old", "new"), store.requests.map { it.songs.single().id })
+        library.release()
+    }
+
+    @Test
+    fun customSortSeedsVisibleOrderAndReusesSavedOrderAfterOtherSorts() = runTest {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        PreferencesTestFixtures.clearMicaSettings(context)
+        val scanner = ControlledScanner()
+        val library = library(scanner, FakeLibraryStore())
+        val z = SongFixtures.song(id = "z", title = "Zulu")
+        val a = SongFixtures.song(id = "a", title = "Alpha")
+        val m = SongFixtures.song(id = "m", title = "Mike")
+
+        val scan = async { library.scanDeviceWide() }
+        runCurrent()
+        scanner.deviceRequests.single().result.complete(ScanResult(listOf(z, a, m), totalSizeMb = 1))
+        scan.await()
+
+        assertEquals(listOf("a", "m", "z"), library.songs.map { it.id })
+
+        library.updateSort(SongSortField.CUSTOM, SortDirection.DESC)
+
+        assertEquals(SongSortField.CUSTOM, library.sortField)
+        assertEquals(SortDirection.ASC, library.sortDirection)
+        assertEquals(listOf("a", "m", "z"), library.songs.map { it.id })
+        assertEquals(listOf("a", "m", "z"), LibraryBrowseSettings.customSongOrderIds(context))
+
+        assertTrue(library.moveSongInLibrary(2, 0))
+        assertEquals(listOf("z", "a", "m"), library.songs.map { it.id })
+        assertEquals(listOf("z", "a", "m"), LibraryBrowseSettings.customSongOrderIds(context))
+
+        library.updateCustomSongOrderLocked(true)
+        assertFalse(library.moveSongInLibrary(1, 2))
+        assertEquals(listOf("z", "a", "m"), library.songs.map { it.id })
+
+        library.updateSort(SongSortField.TITLE, SortDirection.DESC)
+        assertEquals(listOf("z", "m", "a"), library.songs.map { it.id })
+
+        library.updateSort(SongSortField.CUSTOM, SortDirection.ASC)
+        assertEquals(listOf("z", "a", "m"), library.songs.map { it.id })
         library.release()
     }
 

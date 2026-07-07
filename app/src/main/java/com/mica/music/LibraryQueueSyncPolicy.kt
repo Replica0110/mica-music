@@ -24,6 +24,10 @@ internal sealed class LibraryQueueSyncPlan {
 internal class LibraryQueueSyncPolicy {
     private var previousLibraryIds: List<String> = emptyList()
 
+    /**
+     * 曲库 [libraryIds] 顺序变化但集合不变时走 [LibraryQueueSyncPlan.RefreshMetadata]，
+     * 不重排当前播放队列；仅当队列仍含已从曲库移除的 id 时才 [LibraryQueueSyncPlan.SetQueue]。
+     */
     fun plan(
         songs: List<Song>,
         libraryIds: List<String>,
@@ -43,7 +47,7 @@ internal class LibraryQueueSyncPolicy {
                 previousLibraryIdsSize = previousIds.size,
                 currentQueueWasLibrary = currentQueueWasLibrary,
             )
-            currentQueueWasLibrary || currentQueueHasRemovedLibrarySongs -> LibraryQueueSyncPlan.SetQueue(
+            currentQueueHasRemovedLibrarySongs -> LibraryQueueSyncPlan.SetQueue(
                 songs = songs,
                 previousLibraryIdsSize = previousIds.size,
                 currentQueueWasLibrary = currentQueueWasLibrary,
